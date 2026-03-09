@@ -1,77 +1,63 @@
 /**
  * Fathom MCP Server — Cloudflare Worker
  *
- * A stateless remote MCP server that proxies Claude's tool calls
- * to the Fathom API.
+ * Implements OAuth 2.0 Authorization Code flow with PKCE so users can
+ * authenticate via Claude's standard connector UI on claude.ai.
  *
- * Authentication (two layers):
- *   1. WORKER_SECRET env var — a shared secret set at deploy time that gates
- *      access to the Worker itself. Set via `wrangler secret put WORKER_SECRET`.
- *      Clients send it as: Authorization: Bearer WORKER_SECRET:FATHOM_API_KEY
+ * Each user authenticates once by entering their Fathom API key into a
+ * hosted form. The Worker validates the key against Fathom, then issues
+ * an opaque access token stored in Cloudflare KV. Claude sends that token
+ * on every subsequent MCP request; the Worker looks it up to get the
+ * user's Fathom key.
  *
- *   2. Fathom API key — embedded in the same Authorization header (after the
- *      colon), forwarded to Fathom on every upstream request. Never passed as
- *      a URL query parameter.
+ * OAuth endpoints:
+ *   GET  /.well-known/oauth-authorization-server  — metadata discovery
+ *   GET  /oauth/authorize                          — shows the auth form
+ *   POST /oauth/authorize                          — processes form submission
+ *   POST /oauth/token                              — exchanges code for token
+ *   POST /oauth/revoke                             — revokes a token
  *
- * Connector URL (no api_key in URL): https://your-worker.workers.dev/mcp
- * Authorization header:              Bearer <WORKER_SECRET>:<FATHOM_API_KEY>
+ * MCP endpoint:
+ *   POST /mcp                                      — MCP JSON-RPC
+ *   GET  /mcp                                      — SSE transport
+ *
+ * KV schema:
+ *   auth_code:<code>   → JSON { fathomApiKey, codeChallenge, expiresAt }  TTL: 5 min
+ *   token:<token>      → JSON { fathomApiKey, issuedAt }                  TTL: 90 days
  */
 
 const FATHOM_BASE = "https://api.fathom.ai/external/v1";
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 
-// ── Cloudflare Worker env bindings ────────────────────────────────────────────
+// Token lifetimes
+const AUTH_CODE_TTL_SECONDS = 300;        // 5 minutes
+const ACCESS_TOKEN_TTL_SECONDS = 7776000; // 90 days
+
+// ── Env bindings ──────────────────────────────────────────────────────────────
 
 interface Env {
-  // Set via: wrangler secret put WORKER_SECRET
-  // Used to gate access to the Worker itself. Rotate this independently of
-  // Fathom API keys. Keep it out of source control entirely.
-  WORKER_SECRET: string;
+  // KV namespace bound in wrangler.toml as [[kv_namespaces]] binding = "FATHOM_KV"
+  FATHOM_KV: KVNamespace;
 }
 
-// ── Auth helpers ──────────────────────────────────────────────────────────────
+// ── Crypto helpers ────────────────────────────────────────────────────────────
 
-/**
- * Extracts and validates credentials from the Authorization header.
- *
- * Expected format: "Bearer <WORKER_SECRET>:<FATHOM_API_KEY>"
- *
- * Returns the Fathom API key on success, or null if auth fails.
- * Deliberately returns the same null for both missing and invalid credentials
- * to avoid leaking which part failed.
- */
-function extractCredentials(
-  request: Request,
-  env: Env
-): { fathomApiKey: string } | null {
-  const authHeader = request.headers.get("Authorization");
-  if (!authHeader?.startsWith("Bearer ")) return null;
-
-  const token = authHeader.slice(7); // strip "Bearer "
-  const colonIndex = token.indexOf(":");
-  if (colonIndex === -1) return null;
-
-  const workerSecret = token.slice(0, colonIndex);
-  const fathomApiKey = token.slice(colonIndex + 1);
-
-  if (!workerSecret || !fathomApiKey) return null;
-
-  // Constant-time comparison to prevent timing attacks on the secret
-  const expected = env.WORKER_SECRET ?? "";
-  if (expected.length === 0) return null; // fail closed if secret not configured
-  if (!timingSafeEqual(workerSecret, expected)) return null;
-
-  return { fathomApiKey };
+/** Generates a cryptographically random hex string of `bytes` bytes. */
+function randomHex(bytes: number): string {
+  const arr = new Uint8Array(bytes);
+  crypto.getRandomValues(arr);
+  return Array.from(arr)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 /**
- * Constant-time string comparison. Prevents timing-based secret oracle attacks
- * where an attacker could measure response time to guess the secret character
- * by character.
+ * Constant-time string comparison. Prevents timing-based oracle attacks
+ * where an attacker measures response latency to guess secret values
+ * character by character.
  */
 function timingSafeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) {
-    // Still iterate over `a` to keep timing consistent regardless of length mismatch
     let diff = 0;
     for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ 0;
     return false;
@@ -81,6 +67,21 @@ function timingSafeEqual(a: string, b: string): boolean {
     diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return diff === 0;
+}
+
+/**
+ * Verifies a PKCE code_verifier against a stored code_challenge.
+ * Claude uses S256 method: challenge = BASE64URL(SHA-256(verifier))
+ */
+async function verifyPKCE(verifier: string, challenge: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(verifier);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  const base64url = btoa(String.fromCharCode(...new Uint8Array(digest)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return timingSafeEqual(base64url, challenge);
 }
 
 // ── Input validation ──────────────────────────────────────────────────────────
@@ -94,156 +95,44 @@ type ValidationError = { field: string; message: string };
 
 function validateIso8601(value: unknown, field: string): ValidationError | null {
   if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || !ISO8601_RE.test(value)) {
+  if (typeof value !== "string" || !ISO8601_RE.test(value))
     return { field, message: `${field} must be an ISO 8601 datetime (e.g. 2024-01-01T00:00:00Z)` };
-  }
   return null;
 }
 
 function validateEmail(value: unknown, field: string): ValidationError | null {
   if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || !EMAIL_RE.test(value)) {
+  if (typeof value !== "string" || !EMAIL_RE.test(value))
     return { field, message: `${field} must be a valid email address` };
-  }
   return null;
 }
 
 function validateDomain(value: unknown, field: string): ValidationError | null {
   if (value === undefined || value === null || value === "") return null;
-  if (typeof value !== "string" || !DOMAIN_RE.test(value)) {
+  if (typeof value !== "string" || !DOMAIN_RE.test(value))
     return { field, message: `${field} must be a valid domain (e.g. acme.com)` };
-  }
   return null;
 }
 
 function validateRecordingId(value: unknown, field: string): ValidationError | null {
-  if (typeof value !== "string" || !RECORDING_ID_RE.test(value)) {
+  if (typeof value !== "string" || !RECORDING_ID_RE.test(value))
     return { field, message: `${field} must be an alphanumeric ID (hyphens and underscores allowed, max 128 chars)` };
-  }
   return null;
 }
 
 function validateSearchQuery(value: unknown, field: string): ValidationError | null {
-  if (typeof value !== "string" || value.trim().length === 0) {
+  if (typeof value !== "string" || value.trim().length === 0)
     return { field, message: `${field} must be a non-empty string` };
-  }
-  if (value.length > 200) {
+  if (value.length > 200)
     return { field, message: `${field} must be 200 characters or fewer` };
-  }
   return null;
 }
-
-// ── MCP protocol types ────────────────────────────────────────────────────────
-
-interface MCPRequest {
-  jsonrpc: "2.0";
-  id: string | number | null;
-  method: string;
-  params?: Record<string, unknown>;
-}
-
-interface MCPResponse {
-  jsonrpc: "2.0";
-  id: string | number | null;
-  result?: unknown;
-  error?: { code: number; message: string };
-}
-
-// ── Tool definitions ──────────────────────────────────────────────────────────
-
-const TOOLS = [
-  {
-    name: "list_meetings",
-    description:
-      "List Fathom meetings with optional filters. Use this to find a meeting before fetching its transcript or summary. Returns meeting IDs, titles, dates, and attendees.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        created_after: {
-          type: "string",
-          description: "ISO 8601 datetime, e.g. 2024-01-01T00:00:00Z",
-        },
-        created_before: {
-          type: "string",
-          description: "ISO 8601 datetime, e.g. 2024-12-31T23:59:59Z",
-        },
-        invitee_email: {
-          type: "string",
-          description: "Filter by attendee email address, e.g. john@acme.com",
-        },
-        invitee_domain: {
-          type: "string",
-          description: "Filter by attendee email domain, e.g. acme.com",
-        },
-        limit: {
-          type: "number",
-          description: "Number of meetings to return (default 10, max 50)",
-        },
-      },
-    },
-  },
-  {
-    name: "get_transcript",
-    description:
-      "Get the full transcript for a Fathom recording. Returns speaker-labeled, timestamped text. Use list_meetings first to find the recording_id.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        recording_id: {
-          type: "string",
-          description: "The recording ID from list_meetings",
-        },
-      },
-      required: ["recording_id"],
-    },
-  },
-  {
-    name: "get_summary",
-    description:
-      "Get the AI-generated summary and action items for a Fathom recording. Use list_meetings first to find the recording_id.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        recording_id: {
-          type: "string",
-          description: "The recording ID from list_meetings",
-        },
-      },
-      required: ["recording_id"],
-    },
-  },
-  {
-    name: "search_meetings",
-    description:
-      "Search for meetings by attendee name, email, or company domain. Returns matching meetings with their IDs and titles.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: {
-          type: "string",
-          description:
-            "Name, email address, or domain to search for, e.g. 'John Smith', 'john@acme.com', or 'acme.com'",
-        },
-        created_after: {
-          type: "string",
-          description: "Optionally narrow by date range (ISO 8601)",
-        },
-        created_before: {
-          type: "string",
-          description: "Optionally narrow by date range (ISO 8601)",
-        },
-      },
-      required: ["query"],
-    },
-  },
-];
 
 // ── Fathom API helpers ────────────────────────────────────────────────────────
 
 /**
- * Fathom API error — wraps upstream failures with a sanitized message.
- * The raw upstream response body is intentionally NOT forwarded to the caller
- * to avoid leaking internal Fathom API details, stack traces, or token hints.
+ * Wraps Fathom upstream failures. Carries only an HTTP status code —
+ * the raw response body is discarded to prevent leaking internal details.
  */
 class FathomAPIError extends Error {
   constructor(public readonly status: number) {
@@ -260,22 +149,34 @@ async function fathomGet(
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== "") url.searchParams.set(k, v);
   }
-
   const res = await fetch(url.toString(), {
     headers: { "X-Api-Key": apiKey },
   });
-
   if (!res.ok) {
-    // Consume and discard the response body — we only surface the HTTP status.
-    // Forwarding the raw body would leak Fathom's internal error messages.
-    await res.text();
+    await res.text(); // consume and discard
     throw new FathomAPIError(res.status);
   }
-
   return res.json();
 }
 
-// ── Meeting item type ─────────────────────────────────────────────────────────
+/**
+ * Validates a Fathom API key by making a cheap API call.
+ * Returns true if the key is accepted, false if it's rejected (401/403),
+ * throws for unexpected errors.
+ */
+async function validateFathomKey(apiKey: string): Promise<boolean> {
+  try {
+    await fathomGet("/meetings", { limit: "1" }, apiKey);
+    return true;
+  } catch (e) {
+    if (e instanceof FathomAPIError && (e.status === 401 || e.status === 403)) {
+      return false;
+    }
+    throw e;
+  }
+}
+
+// ── Meeting types ─────────────────────────────────────────────────────────────
 
 interface FathomMeeting {
   id?: string | number;
@@ -300,8 +201,6 @@ interface FathomMeeting {
   };
 }
 
-// ── Find a single meeting by ID, paginating through all results ───────────────
-
 async function findMeetingById(
   id: string,
   extraParams: Record<string, string>,
@@ -325,13 +224,11 @@ async function findMeetingById(
     const match = data.items.find(
       (m) => String(m.id) === id || String(m.recording_id) === id
     );
-
     if (match) return match;
     if (!data.next_cursor) break;
     cursor = data.next_cursor;
     pagesFetched++;
   }
-
   return null;
 }
 
@@ -350,9 +247,8 @@ async function handleListMeetings(
   if (e2) errors.push(e2);
   if (e3) errors.push(e3);
   if (e4) errors.push(e4);
-  if (errors.length) {
+  if (errors.length)
     return `Invalid arguments:\n${errors.map((e) => `- ${e.message}`).join("\n")}`;
-  }
 
   const params: Record<string, string> = {};
   if (args.created_after) params.created_after = String(args.created_after);
@@ -394,20 +290,17 @@ async function handleGetTranscript(
   const id = String(args.recording_id);
   const meeting = await findMeetingById(id, { include_transcript: "true" }, apiKey);
 
-  if (!meeting) {
+  if (!meeting)
     return `No meeting found with recording_id "${id}". Use list_meetings to find valid IDs.`;
-  }
 
-  if (!meeting.transcript?.length) {
+  if (!meeting.transcript?.length)
     return `Meeting "${meeting.meeting_title ?? meeting.title}" was found but has no transcript yet. It may still be processing.`;
-  }
 
   const date = (meeting.scheduled_start_time ?? meeting.created_at).split("T")[0];
   const title = meeting.meeting_title ?? meeting.title ?? "Untitled";
   const lines = meeting.transcript.map(
     (t) => `[${t.timestamp}] ${t.speaker.display_name}: ${t.text}`
   );
-
   return `# Transcript: ${title} (${date})\n\n${lines.join("\n")}`;
 }
 
@@ -421,24 +314,18 @@ async function handleGetSummary(
   const id = String(args.recording_id);
   const meeting = await findMeetingById(id, { include_summary: "true" }, apiKey);
 
-  if (!meeting) {
+  if (!meeting)
     return `No meeting found with recording_id "${id}". Use list_meetings to find valid IDs.`;
-  }
 
-  if (!meeting.default_summary) {
+  if (!meeting.default_summary)
     return `Meeting "${meeting.meeting_title ?? meeting.title}" was found but has no summary yet. It may still be processing.`;
-  }
 
   const date = (meeting.scheduled_start_time ?? meeting.created_at).split("T")[0];
   const title = meeting.meeting_title ?? meeting.title ?? "Untitled";
   const summary = meeting.default_summary;
 
   let output = `# Summary: ${title} (${date})\n\n`;
-
-  if (summary.markdown_formatted_summary) {
-    output += summary.markdown_formatted_summary;
-  }
-
+  if (summary.markdown_formatted_summary) output += summary.markdown_formatted_summary;
   if (summary.action_items?.length) {
     output += "\n\n## Action Items\n";
     output += summary.action_items
@@ -448,7 +335,6 @@ async function handleGetSummary(
       })
       .join("\n");
   }
-
   return output;
 }
 
@@ -463,16 +349,14 @@ async function handleSearchMeetings(
   if (qError) errors.push(qError);
   if (e1) errors.push(e1);
   if (e2) errors.push(e2);
-  if (errors.length) {
+  if (errors.length)
     return `Invalid arguments:\n${errors.map((e) => `- ${e.message}`).join("\n")}`;
-  }
 
   const query = String(args.query).toLowerCase().trim();
   const params: Record<string, string> = { limit: "50" };
   if (args.created_after) params.created_after = String(args.created_after);
   if (args.created_before) params.created_before = String(args.created_before);
 
-  // Only pass structured filter params when the query passes the relevant validator
   if (query.includes("@")) {
     if (!validateEmail(query, "query")) params["invitee_emails[]"] = query;
   } else if (query.includes(".") && !query.includes(" ")) {
@@ -513,17 +397,80 @@ async function handleSearchMeetings(
   return `Found ${filtered.length} meeting(s) matching "${args.query}":\n\n${lines.join("\n")}`;
 }
 
-// ── MCP request router ────────────────────────────────────────────────────────
+// ── MCP protocol ──────────────────────────────────────────────────────────────
 
-function ok(id: string | number | null, result: unknown): MCPResponse {
+interface MCPRequest {
+  jsonrpc: "2.0";
+  id: string | number | null;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+interface MCPResponse {
+  jsonrpc: "2.0";
+  id: string | number | null;
+  result?: unknown;
+  error?: { code: number; message: string };
+}
+
+const TOOLS = [
+  {
+    name: "list_meetings",
+    description:
+      "List Fathom meetings with optional filters. Use this to find a meeting before fetching its transcript or summary. Returns meeting IDs, titles, dates, and attendees.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        created_after: { type: "string", description: "ISO 8601 datetime, e.g. 2024-01-01T00:00:00Z" },
+        created_before: { type: "string", description: "ISO 8601 datetime, e.g. 2024-12-31T23:59:59Z" },
+        invitee_email: { type: "string", description: "Filter by attendee email address, e.g. john@acme.com" },
+        invitee_domain: { type: "string", description: "Filter by attendee email domain, e.g. acme.com" },
+        limit: { type: "number", description: "Number of meetings to return (default 10, max 50)" },
+      },
+    },
+  },
+  {
+    name: "get_transcript",
+    description: "Get the full transcript for a Fathom recording. Returns speaker-labeled, timestamped text. Use list_meetings first to find the recording_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        recording_id: { type: "string", description: "The recording ID from list_meetings" },
+      },
+      required: ["recording_id"],
+    },
+  },
+  {
+    name: "get_summary",
+    description: "Get the AI-generated summary and action items for a Fathom recording. Use list_meetings first to find the recording_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        recording_id: { type: "string", description: "The recording ID from list_meetings" },
+      },
+      required: ["recording_id"],
+    },
+  },
+  {
+    name: "search_meetings",
+    description: "Search for meetings by attendee name, email, or company domain. Returns matching meetings with their IDs and titles.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Name, email address, or domain to search for, e.g. 'John Smith', 'john@acme.com', or 'acme.com'" },
+        created_after: { type: "string", description: "Optionally narrow by date range (ISO 8601)" },
+        created_before: { type: "string", description: "Optionally narrow by date range (ISO 8601)" },
+      },
+      required: ["query"],
+    },
+  },
+];
+
+function mcpOk(id: string | number | null, result: unknown): MCPResponse {
   return { jsonrpc: "2.0", id, result };
 }
 
-function err(
-  id: string | number | null,
-  code: number,
-  message: string
-): MCPResponse {
+function mcpErr(id: string | number | null, code: number, message: string): MCPResponse {
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
@@ -532,17 +479,17 @@ async function handleMCP(req: MCPRequest, apiKey: string): Promise<MCPResponse> 
 
   switch (method) {
     case "initialize":
-      return ok(id, {
+      return mcpOk(id, {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
         serverInfo: { name: "fathom-mcp", version: VERSION },
       });
 
     case "notifications/initialized":
-      return ok(id, {});
+      return mcpOk(id, {});
 
     case "tools/list":
-      return ok(id, { tools: TOOLS });
+      return mcpOk(id, { tools: TOOLS });
 
     case "tools/call": {
       const toolName = params?.name as string;
@@ -551,38 +498,25 @@ async function handleMCP(req: MCPRequest, apiKey: string): Promise<MCPResponse> 
       try {
         let text: string;
         switch (toolName) {
-          case "list_meetings":
-            text = await handleListMeetings(args, apiKey);
-            break;
-          case "get_transcript":
-            text = await handleGetTranscript(args, apiKey);
-            break;
-          case "get_summary":
-            text = await handleGetSummary(args, apiKey);
-            break;
-          case "search_meetings":
-            text = await handleSearchMeetings(args, apiKey);
-            break;
+          case "list_meetings":    text = await handleListMeetings(args, apiKey); break;
+          case "get_transcript":   text = await handleGetTranscript(args, apiKey); break;
+          case "get_summary":      text = await handleGetSummary(args, apiKey); break;
+          case "search_meetings":  text = await handleSearchMeetings(args, apiKey); break;
           default:
-            return err(id, -32601, `Unknown tool: ${toolName}`);
+            return mcpErr(id, -32601, `Unknown tool: ${toolName}`);
         }
-        return ok(id, { content: [{ type: "text", text }] });
+        return mcpOk(id, { content: [{ type: "text", text }] });
       } catch (e) {
-        // Surface safe, normalized errors only — never leak raw upstream responses.
         if (e instanceof FathomAPIError) {
           const msg =
-            e.status === 401
-              ? "Fathom authentication failed. Check that your Fathom API key is valid."
-              : e.status === 403
-              ? "Fathom access denied. Your API key may not have permission for this resource."
-              : e.status === 404
-              ? "Fathom resource not found."
-              : e.status === 429
-              ? "Fathom rate limit exceeded. Please wait before retrying."
-              : `Fathom API request failed (HTTP ${e.status}). Please try again.`;
-          return ok(id, { content: [{ type: "text", text: msg }], isError: true });
+            e.status === 401 ? "Fathom authentication failed. Check that your Fathom API key is valid." :
+            e.status === 403 ? "Fathom access denied. Your API key may not have permission for this resource." :
+            e.status === 404 ? "Fathom resource not found." :
+            e.status === 429 ? "Fathom rate limit exceeded. Please wait before retrying." :
+            `Fathom API request failed (HTTP ${e.status}). Please try again.`;
+          return mcpOk(id, { content: [{ type: "text", text: msg }], isError: true });
         }
-        return ok(id, {
+        return mcpOk(id, {
           content: [{ type: "text", text: "An unexpected error occurred. Please try again." }],
           isError: true,
         });
@@ -590,23 +524,26 @@ async function handleMCP(req: MCPRequest, apiKey: string): Promise<MCPResponse> 
     }
 
     default:
-      return err(id, -32601, `Method not found: ${method}`);
+      return mcpErr(id, -32601, `Method not found: ${method}`);
   }
 }
 
-// ── CORS helpers ──────────────────────────────────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────────────────────
 
 /**
- * Returns restrictive CORS headers.
- *
- * This Worker is called server-to-server by Claude — there is no legitimate
- * browser cross-origin use case. We restrict to "null" origin rather than
- * the wildcard (*) that was here previously.
- *
- * If you ever need browser-based access, replace "null" with your specific
- * allowed origin (e.g. "https://claude.ai") rather than re-opening to *.
+ * OAuth endpoints need to accept requests from claude.ai (browser-initiated
+ * redirects during the auth flow). MCP endpoints remain server-to-server.
+ * We allow claude.ai and claude.com explicitly rather than using a wildcard.
  */
-function corsHeaders(): Record<string, string> {
+function oauthCorsHeaders(): Record<string, string> {
+  return {
+    "Access-Control-Allow-Origin": "https://claude.ai",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  };
+}
+
+function mcpCorsHeaders(): Record<string, string> {
   return {
     "Access-Control-Allow-Origin": "null",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -614,96 +551,503 @@ function corsHeaders(): Record<string, string> {
   };
 }
 
-// ── Cloudflare Worker entry point ─────────────────────────────────────────────
+// ── HTML helpers ──────────────────────────────────────────────────────────────
+
+function htmlPage(title: string, body: string): Response {
+  return new Response(
+    `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${title}</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f5f5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 1rem;
+    }
+    .card {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 16px rgba(0,0,0,0.1);
+      padding: 2rem;
+      max-width: 440px;
+      width: 100%;
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 0.5rem; }
+    p { color: #555; font-size: 0.95rem; margin: 0 0 1.5rem; line-height: 1.5; }
+    label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 0.4rem; }
+    input[type=password], input[type=text] {
+      width: 100%;
+      padding: 0.65rem 0.75rem;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      margin-bottom: 1rem;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus { border-color: #7c5ce5; }
+    button {
+      width: 100%;
+      padding: 0.75rem;
+      background: #7c5ce5;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover { background: #6a4fd4; }
+    .error {
+      background: #fff0f0;
+      border: 1px solid #ffcccc;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      color: #c00;
+      font-size: 0.9rem;
+      margin-bottom: 1rem;
+    }
+    .hint { font-size: 0.8rem; color: #888; margin-top: 1rem; text-align: center; }
+    a { color: #7c5ce5; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    ${body}
+  </div>
+</body>
+</html>`,
+    { headers: { "Content-Type": "text/html; charset=utf-8" } }
+  );
+}
+
+// ── OAuth handlers ────────────────────────────────────────────────────────────
+
+/**
+ * GET /.well-known/oauth-authorization-server
+ *
+ * OAuth 2.0 Authorization Server Metadata (RFC 8414).
+ * Claude fetches this to discover the authorize and token endpoints.
+ */
+function handleOAuthMetadata(baseUrl: string): Response {
+  return new Response(
+    JSON.stringify({
+      issuer: baseUrl,
+      authorization_endpoint: `${baseUrl}/oauth/authorize`,
+      token_endpoint: `${baseUrl}/oauth/token`,
+      revocation_endpoint: `${baseUrl}/oauth/revoke`,
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code"],
+      code_challenge_methods_supported: ["S256"],
+      token_endpoint_auth_methods_supported: ["none"],
+    }),
+    { headers: { "Content-Type": "application/json", ...oauthCorsHeaders() } }
+  );
+}
+
+/**
+ * GET /oauth/authorize
+ *
+ * Validates the incoming OAuth request parameters, then serves the
+ * Fathom API key entry form. The state, redirect_uri, and code_challenge
+ * are embedded as hidden fields so the POST handler can use them without
+ * server-side session state.
+ *
+ * Security notes:
+ * - redirect_uri must start with https://claude.ai or https://claude.com
+ * - code_challenge_method must be S256
+ * - state is echoed back to Claude to prevent CSRF
+ */
+function handleAuthorizeGet(url: URL): Response {
+  const redirectUri = url.searchParams.get("redirect_uri") ?? "";
+  const state = url.searchParams.get("state") ?? "";
+  const codeChallenge = url.searchParams.get("code_challenge") ?? "";
+  const codeChallengeMethod = url.searchParams.get("code_challenge_method") ?? "";
+
+  // Validate redirect_uri — only Claude's known callback URLs are accepted
+  if (
+    !redirectUri.startsWith("https://claude.ai/") &&
+    !redirectUri.startsWith("https://claude.com/")
+  ) {
+    return htmlPage(
+      "Invalid Request",
+      `<h1>Invalid Request</h1>
+       <p>The redirect URI is not allowed. This connector only works with Claude.</p>`
+    );
+  }
+
+  // Require PKCE with S256
+  if (!codeChallenge || codeChallengeMethod !== "S256") {
+    return htmlPage(
+      "Invalid Request",
+      `<h1>Invalid Request</h1>
+       <p>PKCE with S256 is required.</p>`
+    );
+  }
+
+  // Encode params for hidden fields — escape to prevent XSS
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+
+  return htmlPage(
+    "Connect Fathom to Claude",
+    `<h1>Connect Fathom to Claude</h1>
+     <p>Enter your Fathom API key to give Claude access to your meeting recordings, transcripts, and summaries.</p>
+     <p>Get your key at <a href="https://fathom.video" target="_blank" rel="noopener">fathom.video</a> → Settings → API Access.</p>
+     <form method="POST" action="/oauth/authorize">
+       <input type="hidden" name="redirect_uri"           value="${esc(redirectUri)}">
+       <input type="hidden" name="state"                  value="${esc(state)}">
+       <input type="hidden" name="code_challenge"         value="${esc(codeChallenge)}">
+       <input type="hidden" name="code_challenge_method"  value="${esc(codeChallengeMethod)}">
+       <label for="api_key">Fathom API Key</label>
+       <input type="password" id="api_key" name="api_key" placeholder="fathom_..." autocomplete="off" required>
+       <button type="submit">Connect</button>
+     </form>
+     <p class="hint">Your API key is validated and stored securely. It is never shared.</p>`
+  );
+}
+
+/**
+ * POST /oauth/authorize
+ *
+ * Processes the form submission:
+ * 1. Validates the Fathom API key by making a real API call
+ * 2. Generates a single-use auth code
+ * 3. Stores code → { fathomApiKey, codeChallenge } in KV with a 5-minute TTL
+ * 4. Redirects back to Claude with the code and state
+ */
+async function handleAuthorizePost(request: Request, env: Env): Promise<Response> {
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return new Response("Bad request", { status: 400 });
+  }
+
+  const redirectUri = formData.get("redirect_uri")?.toString() ?? "";
+  const state = formData.get("state")?.toString() ?? "";
+  const codeChallenge = formData.get("code_challenge")?.toString() ?? "";
+  const codeChallengeMethod = formData.get("code_challenge_method")?.toString() ?? "";
+  const apiKey = formData.get("api_key")?.toString().trim() ?? "";
+
+  // Re-validate redirect_uri on POST — never trust hidden field alone
+  if (
+    !redirectUri.startsWith("https://claude.ai/") &&
+    !redirectUri.startsWith("https://claude.com/")
+  ) {
+    return new Response("Invalid redirect_uri", { status: 400 });
+  }
+
+  if (!codeChallenge || codeChallengeMethod !== "S256") {
+    return new Response("PKCE required", { status: 400 });
+  }
+
+  if (!apiKey) {
+    return htmlPage(
+      "Connect Fathom to Claude",
+      `<div class="error">Please enter your Fathom API key.</div>
+       <h1>Connect Fathom to Claude</h1>
+       <p>Enter your Fathom API key to give Claude access to your meeting recordings.</p>
+       <form method="POST" action="/oauth/authorize">
+         <input type="hidden" name="redirect_uri"          value="${redirectUri}">
+         <input type="hidden" name="state"                 value="${state}">
+         <input type="hidden" name="code_challenge"        value="${codeChallenge}">
+         <input type="hidden" name="code_challenge_method" value="${codeChallengeMethod}">
+         <label for="api_key">Fathom API Key</label>
+         <input type="password" id="api_key" name="api_key" placeholder="fathom_..." autocomplete="off" required>
+         <button type="submit">Connect</button>
+       </form>`
+    );
+  }
+
+  // Validate the key actually works before storing it
+  let keyValid: boolean;
+  try {
+    keyValid = await validateFathomKey(apiKey);
+  } catch {
+    return htmlPage(
+      "Connection Error",
+      `<h1>Connection Error</h1>
+       <p>Could not reach Fathom to verify your API key. Please try again.</p>
+       <p><a href="javascript:history.back()">Go back</a></p>`
+    );
+  }
+
+  if (!keyValid) {
+    return htmlPage(
+      "Connect Fathom to Claude",
+      `<div class="error">That API key wasn't accepted by Fathom. Please check it and try again.</div>
+       <h1>Connect Fathom to Claude</h1>
+       <p>Enter your Fathom API key to give Claude access to your meeting recordings.</p>
+       <form method="POST" action="/oauth/authorize">
+         <input type="hidden" name="redirect_uri"          value="${redirectUri}">
+         <input type="hidden" name="state"                 value="${state}">
+         <input type="hidden" name="code_challenge"        value="${codeChallenge}">
+         <input type="hidden" name="code_challenge_method" value="${codeChallengeMethod}">
+         <label for="api_key">Fathom API Key</label>
+         <input type="password" id="api_key" name="api_key" placeholder="fathom_..." autocomplete="off" required>
+         <button type="submit">Connect</button>
+       </form>`
+    );
+  }
+
+  // Issue a single-use auth code
+  const code = randomHex(32); // 256 bits of entropy
+  await env.FATHOM_KV.put(
+    `auth_code:${code}`,
+    JSON.stringify({ fathomApiKey: apiKey, codeChallenge }),
+    { expirationTtl: AUTH_CODE_TTL_SECONDS }
+  );
+
+  // Redirect back to Claude
+  const callbackUrl = new URL(redirectUri);
+  callbackUrl.searchParams.set("code", code);
+  if (state) callbackUrl.searchParams.set("state", state);
+
+  return Response.redirect(callbackUrl.toString(), 302);
+}
+
+/**
+ * POST /oauth/token
+ *
+ * Exchanges an auth code for an access token.
+ * Verifies PKCE code_verifier against the stored code_challenge.
+ * Auth codes are single-use — deleted immediately after exchange.
+ */
+async function handleToken(request: Request, env: Env): Promise<Response> {
+  let params: URLSearchParams;
+  try {
+    const body = await request.text();
+    params = new URLSearchParams(body);
+  } catch {
+    return oauthError("invalid_request", "Could not parse request body");
+  }
+
+  const grantType = params.get("grant_type");
+  const code = params.get("code") ?? "";
+  const codeVerifier = params.get("code_verifier") ?? "";
+
+  if (grantType !== "authorization_code") {
+    return oauthError("unsupported_grant_type", "Only authorization_code is supported");
+  }
+
+  if (!code || !codeVerifier) {
+    return oauthError("invalid_request", "code and code_verifier are required");
+  }
+
+  // Look up and immediately delete the auth code — single use
+  const stored = await env.FATHOM_KV.get(`auth_code:${code}`);
+  await env.FATHOM_KV.delete(`auth_code:${code}`);
+
+  if (!stored) {
+    return oauthError("invalid_grant", "Authorization code is invalid or expired");
+  }
+
+  let codeData: { fathomApiKey: string; codeChallenge: string };
+  try {
+    codeData = JSON.parse(stored);
+  } catch {
+    return oauthError("server_error", "Internal error");
+  }
+
+  // Verify PKCE
+  const pkceValid = await verifyPKCE(codeVerifier, codeData.codeChallenge);
+  if (!pkceValid) {
+    return oauthError("invalid_grant", "PKCE verification failed");
+  }
+
+  // Issue access token
+  const accessToken = randomHex(32); // 256 bits of entropy
+  await env.FATHOM_KV.put(
+    `token:${accessToken}`,
+    JSON.stringify({ fathomApiKey: codeData.fathomApiKey, issuedAt: Date.now() }),
+    { expirationTtl: ACCESS_TOKEN_TTL_SECONDS }
+  );
+
+  return new Response(
+    JSON.stringify({
+      access_token: accessToken,
+      token_type: "bearer",
+      expires_in: ACCESS_TOKEN_TTL_SECONDS,
+    }),
+    { headers: { "Content-Type": "application/json", ...oauthCorsHeaders() } }
+  );
+}
+
+/**
+ * POST /oauth/revoke
+ *
+ * Revokes an access token (RFC 7009).
+ * Always returns 200 regardless of whether the token existed —
+ * this is per-spec and avoids leaking token validity information.
+ */
+async function handleRevoke(request: Request, env: Env): Promise<Response> {
+  try {
+    const body = await request.text();
+    const params = new URLSearchParams(body);
+    const token = params.get("token");
+    if (token) await env.FATHOM_KV.delete(`token:${token}`);
+  } catch {
+    // Silently ignore — always return 200 per RFC 7009
+  }
+  return new Response(null, { status: 200, headers: oauthCorsHeaders() });
+}
+
+function oauthError(error: string, description: string): Response {
+  return new Response(JSON.stringify({ error, error_description: description }), {
+    status: 400,
+    headers: { "Content-Type": "application/json", ...oauthCorsHeaders() },
+  });
+}
+
+/**
+ * Resolves a Bearer token from the Authorization header to a Fathom API key
+ * by looking it up in KV. Returns null if the token is missing or unknown.
+ */
+async function resolveBearerToken(
+  request: Request,
+  env: Env
+): Promise<string | null> {
+  const authHeader = request.headers.get("Authorization");
+  if (!authHeader?.startsWith("Bearer ")) return null;
+
+  const token = authHeader.slice(7).trim();
+  if (!token) return null;
+
+  const stored = await env.FATHOM_KV.get(`token:${token}`);
+  if (!stored) return null;
+
+  try {
+    const data = JSON.parse(stored) as { fathomApiKey: string };
+    return data.fathomApiKey ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// ── Worker entry point ────────────────────────────────────────────────────────
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const baseUrl = `${url.protocol}//${url.host}`;
 
-    // Health check — intentionally minimal. Returns only a liveness boolean.
-    // No version, runtime info, or config hints that could aid reconnaissance.
+    // ── Health check ───────────────────────────────────────────────────────────
     if (url.pathname === "/" || url.pathname === "/health") {
       return new Response(JSON.stringify({ status: "ok" }), {
         headers: { "Content-Type": "application/json" },
       });
     }
 
-    if (url.pathname !== "/mcp") {
-      return new Response("Not found", { status: 404 });
+    // ── OAuth metadata discovery ───────────────────────────────────────────────
+    if (url.pathname === "/.well-known/oauth-authorization-server") {
+      return handleOAuthMetadata(baseUrl);
     }
 
-    // OPTIONS preflight — no credentials required
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders() });
+    // ── OAuth authorize ────────────────────────────────────────────────────────
+    if (url.pathname === "/oauth/authorize") {
+      if (request.method === "OPTIONS")
+        return new Response(null, { headers: oauthCorsHeaders() });
+      if (request.method === "GET")
+        return handleAuthorizeGet(url);
+      if (request.method === "POST")
+        return handleAuthorizePost(request, env);
+      return new Response("Method not allowed", { status: 405 });
     }
 
-    // All /mcp requests beyond OPTIONS require valid credentials
-    const creds = extractCredentials(request, env);
-    if (!creds) {
-      return new Response(
-        JSON.stringify({
-          error:
-            "Unauthorized. Set Authorization header: Bearer <WORKER_SECRET>:<FATHOM_API_KEY>",
-        }),
-        { status: 401, headers: { "Content-Type": "application/json" } }
-      );
+    // ── OAuth token ────────────────────────────────────────────────────────────
+    if (url.pathname === "/oauth/token") {
+      if (request.method === "OPTIONS")
+        return new Response(null, { headers: oauthCorsHeaders() });
+      if (request.method === "POST")
+        return handleToken(request, env);
+      return new Response("Method not allowed", { status: 405 });
     }
 
-    const { fathomApiKey } = creds;
+    // ── OAuth revoke ───────────────────────────────────────────────────────────
+    if (url.pathname === "/oauth/revoke") {
+      if (request.method === "OPTIONS")
+        return new Response(null, { headers: oauthCorsHeaders() });
+      if (request.method === "POST")
+        return handleRevoke(request, env);
+      return new Response("Method not allowed", { status: 405 });
+    }
 
-    if (request.method === "POST") {
-      let body: MCPRequest;
-      try {
-        body = await request.json();
-      } catch {
+    // ── MCP ────────────────────────────────────────────────────────────────────
+    if (url.pathname === "/mcp") {
+      if (request.method === "OPTIONS")
+        return new Response(null, { headers: mcpCorsHeaders() });
+
+      // Resolve the Bearer token to a Fathom API key
+      const fathomApiKey = await resolveBearerToken(request, env);
+      if (!fathomApiKey) {
         return new Response(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: null,
-            error: { code: -32700, message: "Parse error" },
-          }),
-          { status: 400, headers: { "Content-Type": "application/json" } }
+          JSON.stringify({ error: "Unauthorized. Connect via Claude's Connectors settings." }),
+          { status: 401, headers: { "Content-Type": "application/json" } }
         );
       }
 
-      const response = await handleMCP(body, fathomApiKey);
-      return new Response(JSON.stringify(response), {
-        headers: { "Content-Type": "application/json", ...corsHeaders() },
-      });
-    }
-
-    if (request.method === "GET") {
-      const { readable, writable } = new TransformStream();
-      const writer = writable.getWriter();
-      const encoder = new TextEncoder();
-
-      const send = async (data: unknown) => {
-        await writer.write(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
-      };
-
-      (async () => {
+      if (request.method === "POST") {
+        let body: MCPRequest;
         try {
-          await send({
-            jsonrpc: "2.0",
-            method: "sse/connected",
-            params: { serverInfo: { name: "fathom-mcp", version: VERSION } },
-          });
-          await new Promise((resolve) => setTimeout(resolve, 30000));
-        } finally {
-          await writer.close();
+          body = await request.json();
+        } catch {
+          return new Response(
+            JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }),
+            { status: 400, headers: { "Content-Type": "application/json" } }
+          );
         }
-      })();
+        const response = await handleMCP(body, fathomApiKey);
+        return new Response(JSON.stringify(response), {
+          headers: { "Content-Type": "application/json", ...mcpCorsHeaders() },
+        });
+      }
 
-      return new Response(readable, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-          ...corsHeaders(),
-        },
-      });
+      if (request.method === "GET") {
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        const encoder = new TextEncoder();
+
+        const send = async (data: unknown) => {
+          await writer.write(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        };
+
+        (async () => {
+          try {
+            await send({
+              jsonrpc: "2.0",
+              method: "sse/connected",
+              params: { serverInfo: { name: "fathom-mcp", version: VERSION } },
+            });
+            await new Promise((resolve) => setTimeout(resolve, 30000));
+          } finally {
+            await writer.close();
+          }
+        })();
+
+        return new Response(readable, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+            ...mcpCorsHeaders(),
+          },
+        });
+      }
+
+      return new Response("Method not allowed", { status: 405 });
     }
 
-    return new Response("Method not allowed", { status: 405 });
+    return new Response("Not found", { status: 404 });
   },
 };

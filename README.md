@@ -1,14 +1,12 @@
 # Fathom MCP Server
 
-A remote [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that connects Claude to your Fathom meeting recordings. Once added as a connector in Claude, you can ask Claude to pull transcripts, summaries, and action items from your Fathom meetings directly — no copy-pasting required.
+A remote [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that connects Claude to your Fathom meeting recordings. Add it as a connector on claude.ai and ask Claude to pull transcripts, summaries, and action items from your meetings directly.
 
-Runs on Cloudflare Workers. Free tier is sufficient for any normal usage.
+Runs on Cloudflare Workers + KV. Free tier is sufficient for normal usage.
 
 ---
 
 ## For team members: adding the connector to Claude
-
-You need two things: your Fathom API key, and the connector token provided by whoever deployed this server.
 
 ### Step 1: Get your Fathom API key
 
@@ -16,60 +14,23 @@ You need two things: your Fathom API key, and the connector token provided by wh
 2. Click your avatar → **Settings** → **API Access**
 3. Click **Generate API Key** and copy it
 
-Your API key only accesses meetings recorded by you or shared with your team. It cannot access other users' private meetings.
+Your API key only accesses meetings recorded by you or shared with your team.
 
-### Step 2: Construct your connector token
-
-Your connector token is:
-
-```
-WORKER_SECRET:YOUR_FATHOM_API_KEY
-```
-
-Where `WORKER_SECRET` is the shared secret distributed privately by whoever deployed this server (never committed to source control or shared in chat). Ask your admin for it if you don't have it.
-
-**Treat this token like a password.** Do not paste it in Slack, commit it to version control, or include it in screenshots.
-
-### Step 3: Add the connector to Claude
-
-**On claude.ai (web):**
+### Step 2: Add the connector on claude.ai
 
 1. Go to **Settings → Connectors**
 2. Click **Add custom connector**
-3. Enter the Worker URL (ask your admin — it is not published in this README):
+3. Enter the Worker URL (ask your admin — not published in this README):
    ```
    https://YOUR-WORKER-SUBDOMAIN.workers.dev/mcp
    ```
-4. When prompted for an Authorization header, enter:
-   ```
-   Bearer WORKER_SECRET:YOUR_FATHOM_API_KEY
-   ```
-5. Click **Add**
+4. Click **Add** — Claude will redirect you to a Fathom key entry form
+5. Enter your Fathom API key and click **Connect**
+6. Claude will confirm the connection
 
-**On Claude Desktop:**
+That's it. Your key is validated against Fathom before being stored, so you'll know immediately if something is wrong.
 
-1. Open your Claude Desktop config file:
-   - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-   - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-2. Add this to the `mcpServers` section, substituting real values:
-   ```json
-   {
-     "mcpServers": {
-       "fathom": {
-         "type": "http",
-         "url": "https://YOUR-WORKER-SUBDOMAIN.workers.dev/mcp",
-         "headers": {
-           "Authorization": "Bearer WORKER_SECRET:YOUR_FATHOM_API_KEY"
-         }
-       }
-     }
-   }
-   ```
-3. Save and restart Claude Desktop
-
-> **Note:** The `claude_desktop_config.json` file is stored unencrypted on disk. Do not back this file up to cloud storage (iCloud, Dropbox, GitHub dotfiles) while it contains credentials.
-
-### Step 4: Try it
+### Step 3: Try it
 
 Ask Claude something like:
 
@@ -77,6 +38,10 @@ Ask Claude something like:
 - _"Get the transcript from my last call with acme.com"_
 - _"Summarize the action items from my meeting with John on March 4th"_
 - _"Search for meetings with sarah@prospect.com"_
+
+### Revoking access
+
+To disconnect Claude from your Fathom account, go to **Settings → Connectors** on claude.ai and remove the Fathom connector. Your token is deleted from the server.
 
 ---
 
@@ -93,11 +58,15 @@ Ask Claude something like:
 
 ## Security
 
-- **API keys are never passed as URL query parameters.** All credentials travel in the `Authorization` header, which is not recorded in server logs, browser history, or proxy logs.
-- **The Worker is gated by a shared secret (`WORKER_SECRET`)** stored as a Cloudflare secret (not in source control). Only callers who know the secret can use the Worker at all.
-- **This server is stateless.** Every request forwards your Fathom API key directly to Fathom's API and returns the result. Nothing is logged or cached.
-- **Your Fathom API key is scoped to your own meetings.** Fathom API keys are user-level — they cannot access other users' unshared recordings.
-- **The Worker URL is not published in this README.** Distribute it privately to team members to reduce the attack surface.
+- **OAuth 2.0 with PKCE.** Authentication follows the standard authorization code flow. PKCE prevents auth code interception attacks.
+- **Fathom API keys are validated before storage.** An invalid key is rejected at the form — it is never stored.
+- **Tokens are 256-bit random values** stored in Cloudflare KV. They are not guessable or derivable from any public information.
+- **Auth codes are single-use and expire in 5 minutes.** They are deleted immediately upon exchange.
+- **Access tokens expire after 90 days.** Users can revoke them at any time via Claude's connector settings.
+- **The Worker URL is not published in this README.** Distribute it privately to reduce the attack surface.
+- **All input is validated** before being forwarded to Fathom's API.
+- **Upstream error bodies are discarded.** Only safe, normalized error messages are returned to Claude.
+- **CORS is restricted.** OAuth endpoints accept `claude.ai` only. MCP endpoints are server-to-server only.
 
 ---
 
@@ -108,69 +77,54 @@ Ask Claude something like:
 - [Node.js](https://nodejs.org) 18 or higher
 - A [Cloudflare account](https://cloudflare.com) (free)
 
-### First-time setup
+### Step 1: Create a KV namespace
+
+In the [Cloudflare dashboard](https://dash.cloudflare.com):
+
+1. Go to **Workers & Pages → KV**
+2. Click **Create namespace**
+3. Name it `fathom-mcp-tokens` (or anything you like)
+4. Copy the **Namespace ID**
+
+### Step 2: Add the KV ID to wrangler.toml
+
+Open `wrangler.toml` and replace `PASTE_YOUR_KV_NAMESPACE_ID_HERE` with the ID you just copied:
+
+```toml
+[[kv_namespaces]]
+binding = "FATHOM_KV"
+id = "your-actual-namespace-id-here"
+```
+
+### Step 3: Deploy
 
 ```bash
-# Clone the repo
-git clone https://github.com/YOUR_ORG/fathom-mcp.git
-cd fathom-mcp
-
-# Install dependencies
 npm install
-
-# Log in to Cloudflare (opens browser)
-npx wrangler login
-```
-
-### Set the Worker secret
-
-Before deploying, set the shared secret that gates access to the Worker. Generate a strong random value (e.g. `openssl rand -hex 32`):
-
-```bash
-wrangler secret put WORKER_SECRET
-# Paste your generated secret at the prompt. It is stored encrypted in Cloudflare
-# and never appears in wrangler.toml or source code.
-```
-
-Distribute this secret to team members privately (e.g. via a password manager or secure channel). Do **not** put it in this README, Slack, or any version-controlled file.
-
-### Deploy
-
-```bash
 npm run deploy
 ```
 
-Wrangler will output a URL like `https://fathom-mcp.YOUR-SUBDOMAIN.workers.dev`. Share this URL with team members through a private channel, not in this README.
+Wrangler will output your Worker URL. Share it privately with team members — do not put it in this README.
 
-### Test it locally
+### Testing locally
 
 ```bash
 npm run dev
 ```
 
-This starts the Worker locally at `http://localhost:8787`. Test with curl:
+Local dev doesn't have access to production KV. To test OAuth locally, create a preview KV namespace in the Cloudflare dashboard and add it to wrangler.toml:
 
-```bash
-# Health check (no auth required)
-curl http://localhost:8787/health
-
-# List tools
-curl -X POST http://localhost:8787/mcp \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_WORKER_SECRET:YOUR_FATHOM_KEY" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-
-# List meetings
-curl -X POST http://localhost:8787/mcp \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer YOUR_WORKER_SECRET:YOUR_FATHOM_KEY" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_meetings","arguments":{"limit":5}}}'
+```toml
+[[kv_namespaces]]
+binding = "FATHOM_KV"
+id = "your-production-id"
+preview_id = "your-preview-id"
 ```
 
-### Rotating credentials
+### Rotating / revoking tokens
 
-- **Fathom API key compromised:** The user regenerates their key in Fathom Settings and updates their connector header. No redeployment needed.
-- **Worker secret compromised:** Run `wrangler secret put WORKER_SECRET` with a new value and redeploy. All team members must update their connector headers.
+Individual tokens can be deleted from **Workers & Pages → KV → fathom-mcp-tokens** in the Cloudflare dashboard. Keys are prefixed `token:`.
+
+To invalidate all tokens at once (e.g. security incident), delete all keys in the KV namespace. All users will need to re-authenticate.
 
 ### Updating
 
@@ -179,23 +133,24 @@ git pull
 npm run deploy
 ```
 
-Cloudflare deploys are instant and zero-downtime.
+Zero-downtime. Existing tokens continue to work after redeploy.
 
 ---
 
 ## Troubleshooting
 
-**"No meetings found"** — Your Fathom API key is valid but no meetings match the filters. Try without date filters first.
+**"That API key wasn't accepted"** — Check the key in Fathom Settings → API Access. Regenerate if needed.
 
-**401 / Unauthorized** — Either the Worker secret or Fathom API key in your Authorization header is wrong or missing. Check the header format: `Bearer WORKER_SECRET:FATHOM_API_KEY`.
+**"Unauthorized"** in Claude — Your token may have expired (90 days) or been revoked. Remove and re-add the connector.
 
-**Connector shows as disconnected in Claude** — Remove and re-add the connector. Sometimes Claude Desktop needs a restart.
+**Connector shows as disconnected** — Remove and re-add the connector in Claude Settings.
 
 ---
 
 ## Stack
 
 - [Cloudflare Workers](https://workers.cloudflare.com) — serverless hosting
+- [Cloudflare KV](https://developers.cloudflare.com/kv/) — token storage
 - [Fathom API](https://developers.fathom.ai) — meeting data source
 - [Model Context Protocol](https://modelcontextprotocol.io) — Claude integration standard
 
