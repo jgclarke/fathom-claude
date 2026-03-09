@@ -32,7 +32,7 @@ const VERSION = "1.2.0";
 
 // Token lifetimes
 const AUTH_CODE_TTL_SECONDS = 300;        // 5 minutes
-const ACCESS_TOKEN_TTL_SECONDS = 7776000; // 90 days
+const ACCESS_TOKEN_TTL_SECONDS = 2592000; // 30 days
 
 // ── Env bindings ──────────────────────────────────────────────────────────────
 
@@ -141,11 +141,16 @@ class FathomAPIError extends Error {
   }
 }
 
+const ALLOWED_FATHOM_PATH_PREFIXES = ["/meetings", "/recordings/"];
+
 async function fathomGet(
   path: string,
   params: Record<string, string>,
   apiKey: string
 ): Promise<unknown> {
+  if (!ALLOWED_FATHOM_PATH_PREFIXES.some((p) => path.startsWith(p))) {
+    throw new Error(`Disallowed API path: ${path}`);
+  }
   const url = new URL(`${FATHOM_BASE}${path}`);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== "") url.searchParams.set(k, v);
@@ -202,17 +207,25 @@ interface FathomMeeting {
   };
 }
 
-async function findMeetingById(
-  id: string,
-  extraParams: Record<string, string>,
-  apiKey: string
-): Promise<FathomMeeting | null> {
+// ── Tool handlers ─────────────────────────────────────────────────────────────
+
+/**
+ * Fetches ALL meetings from Fathom by following pagination cursors.
+ * Fathom's server-side filters (invitee_domain, invitee_email) are unreliable
+ * so we fetch everything and filter client-side.
+ * Date range params are still sent to the API as those appear to work correctly.
+ */
+async function fetchAllMeetings(
+  dateParams: Record<string, string>,
+  apiKey: string,
+  maxPages = 10
+): Promise<{ meetings: FathomMeeting[]; truncated: boolean }> {
+  const all: FathomMeeting[] = [];
   let cursor: string | undefined;
   let pagesFetched = 0;
-  const MAX_PAGES = 20;
 
-  while (pagesFetched < MAX_PAGES) {
-    const params: Record<string, string> = { limit: "50", ...extraParams };
+  while (pagesFetched < maxPages) {
+    const params: Record<string, string> = { limit: "50", ...dateParams };
     if (cursor) params.cursor = cursor;
 
     const data = (await fathomGet("/meetings", params, apiKey)) as {
@@ -221,19 +234,29 @@ async function findMeetingById(
     };
 
     if (!data.items?.length) break;
-
-    const match = data.items.find(
-      (m) => String(m.id) === id || String(m.recording_id) === id
-    );
-    if (match) return match;
+    all.push(...data.items);
     if (!data.next_cursor) break;
     cursor = data.next_cursor;
     pagesFetched++;
   }
-  return null;
+
+  // If we exited because we hit maxPages AND there was still a next_cursor on
+  // the last page, results were silently truncated — flag it for callers.
+  const truncated = pagesFetched >= maxPages;
+  return { meetings: all, truncated };
 }
 
-// ── Tool handlers ─────────────────────────────────────────────────────────────
+function formatMeetingLine(m: FathomMeeting): string {
+  const id = String(m.recording_id ?? m.id ?? "unknown");
+  const date = (m.scheduled_start_time ?? m.created_at).split("T")[0];
+  const title = m.meeting_title ?? m.title ?? "Untitled";
+  const attendees =
+    m.calendar_invitees
+      ?.filter((i) => i.is_external)
+      .map((i) => `${i.name} <${i.email}>`)
+      .join(", ") ?? "";
+  return `• [${id}] ${title} — ${date}${attendees ? ` | External: ${attendees}` : ""}`;
+}
 
 async function handleListMeetings(
   args: Record<string, unknown>,
@@ -251,34 +274,37 @@ async function handleListMeetings(
   if (errors.length)
     return `Invalid arguments:\n${errors.map((e) => `- ${e.message}`).join("\n")}`;
 
-  const params: Record<string, string> = {};
-  if (args.created_after) params.created_after = String(args.created_after);
-  if (args.created_before) params.created_before = String(args.created_before);
-  if (args.invitee_email) params["invitee_emails[]"] = String(args.invitee_email);
-  if (args.invitee_domain) params["invitee_domains[]"] = String(args.invitee_domain);
+  const dateParams: Record<string, string> = {};
+  if (args.created_after) dateParams.created_after = String(args.created_after);
+  if (args.created_before) dateParams.created_before = String(args.created_before);
 
-  const rawLimit = Number(args.limit ?? 10);
-  params.limit = String(Math.min(isNaN(rawLimit) ? 10 : rawLimit, 50));
+  const filterEmail = args.invitee_email ? String(args.invitee_email).toLowerCase() : null;
+  const filterDomain = args.invitee_domain ? String(args.invitee_domain).toLowerCase() : null;
+  const rawLimit = Number(args.limit ?? 50);
+  const limit = isNaN(rawLimit) ? 50 : Math.max(1, rawLimit);
 
-  const data = (await fathomGet("/meetings", params, apiKey)) as {
-    items: FathomMeeting[];
-  };
+  const { meetings: all, truncated } = await fetchAllMeetings(dateParams, apiKey);
 
-  if (!data.items?.length) return "No meetings found matching those filters.";
-
-  const lines = data.items.map((m) => {
-    const id = String(m.recording_id ?? m.id ?? "unknown");
-    const date = (m.scheduled_start_time ?? m.created_at).split("T")[0];
-    const title = m.meeting_title ?? m.title ?? "Untitled";
-    const attendees =
-      m.calendar_invitees
-        ?.filter((i) => i.is_external)
-        .map((i) => `${i.name} <${i.email}>`)
-        .join(", ") ?? "";
-    return `• [${id}] ${title} — ${date}${attendees ? ` | External: ${attendees}` : ""}`;
+  const filtered = all.filter((m) => {
+    if (!filterEmail && !filterDomain) return true;
+    const invitees = m.calendar_invitees ?? [];
+    if (filterEmail) return invitees.some((i) => i.email.toLowerCase() === filterEmail);
+    if (filterDomain) return invitees.some((i) => i.email.toLowerCase().endsWith(`@${filterDomain}`));
+    return true;
   });
 
-  return `Found ${data.items.length} meeting(s):\n\n${lines.join("\n")}`;
+  if (!filtered.length) return "No meetings found matching those filters.";
+
+  const results = filtered.slice(0, limit);
+  const lines = results.map(formatMeetingLine);
+  const truncNote = truncated
+    ? `\n\n(Results may be incomplete — search was capped at 500 meetings. Narrow the range with created_after/created_before.)`
+    : "";
+  const limitNote = filtered.length > limit
+    ? `\n\n(Showing ${limit} of ${filtered.length} matches. Narrow the range with created_after/created_before.)`
+    : "";
+
+  return `Found ${filtered.length} meeting(s):\n\n${lines.join("\n")}${limitNote}${truncNote}`;
 }
 
 async function handleGetTranscript(
@@ -289,20 +315,23 @@ async function handleGetTranscript(
   if (idError) return `Invalid argument: ${idError.message}`;
 
   const id = String(args.recording_id);
-  const meeting = await findMeetingById(id, { include_transcript: "true" }, apiKey);
 
-  if (!meeting)
-    return `No meeting found with recording_id "${id}". Use list_meetings to find valid IDs.`;
+  // Use the dedicated transcript endpoint — OAuth apps cannot use
+  // include_transcript on /meetings. This is also a single HTTP call
+  // vs. paginating through all meetings looking for the ID.
+  const data = (await fathomGet(
+    `/recordings/${id}/transcript`,
+    {},
+    apiKey
+  )) as { transcript?: Array<{ speaker: { display_name: string }; text: string; timestamp: string }> };
 
-  if (!meeting.transcript?.length)
-    return `Meeting "${meeting.meeting_title ?? meeting.title}" was found but has no transcript yet. It may still be processing.`;
+  if (!data.transcript?.length)
+    return `No transcript found. The recording may still be processing, or the ID may be invalid. Use list_meetings to verify.`;
 
-  const date = (meeting.scheduled_start_time ?? meeting.created_at).split("T")[0];
-  const title = meeting.meeting_title ?? meeting.title ?? "Untitled";
-  const lines = meeting.transcript.map(
+  const lines = data.transcript.map(
     (t) => `[${t.timestamp}] ${t.speaker.display_name}: ${t.text}`
   );
-  return `# Transcript: ${title} (${date})\n\n${lines.join("\n")}`;
+  return `# Transcript (recording ${id})\n\n${lines.join("\n")}`;
 }
 
 async function handleGetSummary(
@@ -313,30 +342,25 @@ async function handleGetSummary(
   if (idError) return `Invalid argument: ${idError.message}`;
 
   const id = String(args.recording_id);
-  const meeting = await findMeetingById(id, { include_summary: "true" }, apiKey);
 
-  if (!meeting)
-    return `No meeting found with recording_id "${id}". Use list_meetings to find valid IDs.`;
+  // Use the dedicated summary endpoint — OAuth apps cannot use
+  // include_summary on /meetings. Response shape:
+  //   { summary: { template_name: string, markdown_formatted: string } }
+  // Note: action_items are only available via the /meetings inline embed
+  // which OAuth apps cannot use. The summary markdown often includes them.
+  const data = (await fathomGet(
+    `/recordings/${id}/summary`,
+    {},
+    apiKey
+  )) as { summary?: { template_name?: string; markdown_formatted?: string } };
 
-  if (!meeting.default_summary)
-    return `Meeting "${meeting.meeting_title ?? meeting.title}" was found but has no summary yet. It may still be processing.`;
+  if (!data.summary?.markdown_formatted)
+    return `No summary found. The recording may still be processing, or the ID may be invalid. Use list_meetings to verify.`;
 
-  const date = (meeting.scheduled_start_time ?? meeting.created_at).split("T")[0];
-  const title = meeting.meeting_title ?? meeting.title ?? "Untitled";
-  const summary = meeting.default_summary;
+  const { template_name, markdown_formatted } = data.summary;
+  const templateNote = template_name ? ` _(${template_name} template)_` : "";
 
-  let output = `# Summary: ${title} (${date})\n\n`;
-  if (summary.markdown_formatted_summary) output += summary.markdown_formatted_summary;
-  if (summary.action_items?.length) {
-    output += "\n\n## Action Items\n";
-    output += summary.action_items
-      .map((a) => {
-        const who = a.assignee ? ` _(${a.assignee.display_name})_` : "";
-        return `- [ ] ${a.text}${who}`;
-      })
-      .join("\n");
-  }
-  return output;
+  return `# Summary (recording ${id})${templateNote}\n\n${markdown_formatted}`;
 }
 
 async function handleSearchMeetings(
@@ -354,48 +378,36 @@ async function handleSearchMeetings(
     return `Invalid arguments:\n${errors.map((e) => `- ${e.message}`).join("\n")}`;
 
   const query = String(args.query).toLowerCase().trim();
-  const params: Record<string, string> = { limit: "50" };
-  if (args.created_after) params.created_after = String(args.created_after);
-  if (args.created_before) params.created_before = String(args.created_before);
 
-  if (query.includes("@")) {
-    if (!validateEmail(query, "query")) params["invitee_emails[]"] = query;
-  } else if (query.includes(".") && !query.includes(" ")) {
-    if (!validateDomain(query, "query")) params["invitee_domains[]"] = query;
-  }
+  const dateParams: Record<string, string> = {};
+  if (args.created_after) dateParams.created_after = String(args.created_after);
+  if (args.created_before) dateParams.created_before = String(args.created_before);
 
-  const data = (await fathomGet("/meetings", params, apiKey)) as {
-    items: FathomMeeting[];
-  };
+  // Fetch all pages client-side — Fathom server-side filters are unreliable
+  const { meetings: all, truncated } = await fetchAllMeetings(dateParams, apiKey);
 
-  if (!data.items?.length) return `No meetings found matching "${args.query}".`;
+  const filtered = all.filter((m) => {
+    const title = (m.meeting_title ?? m.title ?? "").toLowerCase();
+    const invitees = m.calendar_invitees ?? [];
+    const attendeeText = invitees.map((i) => `${i.name} ${i.email}`.toLowerCase()).join(" ");
 
-  const filtered =
-    query.includes("@") || (query.includes(".") && !query.includes(" "))
-      ? data.items
-      : data.items.filter((m) => {
-          const title = (m.meeting_title ?? m.title ?? "").toLowerCase();
-          const attendees = (m.calendar_invitees ?? [])
-            .map((i) => `${i.name} ${i.email}`.toLowerCase())
-            .join(" ");
-          return title.includes(query) || attendees.includes(query);
-        });
+    if (query.includes("@")) {
+      return invitees.some((i) => i.email.toLowerCase() === query);
+    }
+    if (query.includes(".") && !query.includes(" ")) {
+      return invitees.some((i) => i.email.toLowerCase().endsWith(`@${query}`));
+    }
+    return title.includes(query) || attendeeText.includes(query);
+  });
 
   if (!filtered.length) return `No meetings found matching "${args.query}".`;
 
-  const lines = filtered.map((m) => {
-    const id = String(m.recording_id ?? m.id ?? "unknown");
-    const date = (m.scheduled_start_time ?? m.created_at).split("T")[0];
-    const title = m.meeting_title ?? m.title ?? "Untitled";
-    const attendees =
-      m.calendar_invitees
-        ?.filter((i) => i.is_external)
-        .map((i) => `${i.name} <${i.email}>`)
-        .join(", ") ?? "";
-    return `• [${id}] ${title} — ${date}${attendees ? ` | ${attendees}` : ""}`;
-  });
+  const lines = filtered.map(formatMeetingLine);
+  const truncNote = truncated
+    ? `\n\n(Results may be incomplete — search was capped at 500 meetings. Narrow the range with created_after/created_before.)`
+    : "";
 
-  return `Found ${filtered.length} meeting(s) matching "${args.query}":\n\n${lines.join("\n")}`;
+  return `Found ${filtered.length} meeting(s) matching "${args.query}":\n\n${lines.join("\n")}${truncNote}`;
 }
 
 // ── MCP protocol ──────────────────────────────────────────────────────────────
@@ -555,13 +567,14 @@ function mcpCorsHeaders(): Record<string, string> {
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
 function htmlPage(title: string, body: string): Response {
+  const escTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;");
   return new Response(
     `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${title}</title>
+  <title>${escTitle}</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -796,6 +809,10 @@ async function handleAuthorizePost(request: Request, env: Env): Promise<Response
   const codeChallengeMethod = formData.get("code_challenge_method")?.toString() ?? "";
   const apiKey = formData.get("api_key")?.toString().trim() ?? "";
 
+  // Escape helper for re-rendering values into HTML attributes
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+
   // Re-validate redirect_uri on POST — never trust hidden field alone
   if (
     !redirectUri.startsWith("https://claude.ai/") &&
@@ -815,10 +832,10 @@ async function handleAuthorizePost(request: Request, env: Env): Promise<Response
        <h1>Connect Fathom to Claude</h1>
        <p>Enter your Fathom API key to give Claude access to your meeting recordings.</p>
        <form method="POST" action="/oauth/authorize">
-         <input type="hidden" name="redirect_uri"          value="${redirectUri}">
-         <input type="hidden" name="state"                 value="${state}">
-         <input type="hidden" name="code_challenge"        value="${codeChallenge}">
-         <input type="hidden" name="code_challenge_method" value="${codeChallengeMethod}">
+         <input type="hidden" name="redirect_uri"          value="${esc(redirectUri)}">
+         <input type="hidden" name="state"                 value="${esc(state)}">
+         <input type="hidden" name="code_challenge"        value="${esc(codeChallenge)}">
+         <input type="hidden" name="code_challenge_method" value="${esc(codeChallengeMethod)}">
          <label for="api_key">Fathom API Key</label>
          <input type="password" id="api_key" name="api_key" placeholder="fathom_..." autocomplete="off" required>
          <button type="submit">Connect</button>
@@ -846,10 +863,10 @@ async function handleAuthorizePost(request: Request, env: Env): Promise<Response
        <h1>Connect Fathom to Claude</h1>
        <p>Enter your Fathom API key to give Claude access to your meeting recordings.</p>
        <form method="POST" action="/oauth/authorize">
-         <input type="hidden" name="redirect_uri"          value="${redirectUri}">
-         <input type="hidden" name="state"                 value="${state}">
-         <input type="hidden" name="code_challenge"        value="${codeChallenge}">
-         <input type="hidden" name="code_challenge_method" value="${codeChallengeMethod}">
+         <input type="hidden" name="redirect_uri"          value="${esc(redirectUri)}">
+         <input type="hidden" name="state"                 value="${esc(state)}">
+         <input type="hidden" name="code_challenge"        value="${esc(codeChallenge)}">
+         <input type="hidden" name="code_challenge_method" value="${esc(codeChallengeMethod)}">
          <label for="api_key">Fathom API Key</label>
          <input type="password" id="api_key" name="api_key" placeholder="fathom_..." autocomplete="off" required>
          <button type="submit">Connect</button>
