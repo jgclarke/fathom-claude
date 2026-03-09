@@ -261,6 +261,11 @@ async function fetchAllMeetings(
 
     if (!data.next_cursor) break;
     cursor = data.next_cursor;
+
+    // Fathom allows 60 requests/minute across all API keys.
+    // A 1-second delay between pages keeps us well under that limit
+    // regardless of how many pages we fetch.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 
   const truncated = pagesFetched >= SAFETY_CAP;
