@@ -3,12 +3,12 @@
   "version": "1.0.0",
   "description": "Remote MCP server for Fathom meeting transcripts — runs on Cloudflare Workers",
   "main": "src/index.ts",
- "scripts": {
-  "dev": "wrangler dev",
-  "predeploy": "npm audit --audit-level=high",
-  "deploy": "wrangler deploy",
-  "typecheck": "tsc --noEmit",
-  "audit": "npm audit"
+  "scripts": {
+    "dev": "wrangler dev",
+    "predeploy": "npm audit --audit-level=high",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "audit": "npm audit"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240208.0",
