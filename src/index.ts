@@ -275,26 +275,57 @@ async function handleListMeetings(
   if (errors.length)
     return `Invalid arguments:\n${errors.map((e) => `- ${e.message}`).join("\n")}`;
 
+  // Normalize date-only strings to full ISO timestamps before sending to Fathom,
+  // which requires the full datetime format.
+  const normalizeDate = (v: unknown): string | null => {
+    if (!v) return null;
+    const s = String(v);
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T00:00:00Z` : s;
+  };
+
   const dateParams: Record<string, string> = {};
-  if (args.created_after) dateParams.created_after = String(args.created_after);
-  if (args.created_before) dateParams.created_before = String(args.created_before);
+  const after = normalizeDate(args.created_after);
+  const before = normalizeDate(args.created_before);
+  if (after) dateParams.created_after = after;
+  if (before) dateParams.created_before = before;
 
   const filterEmail = args.invitee_email ? String(args.invitee_email).toLowerCase() : null;
   const filterDomain = args.invitee_domain ? String(args.invitee_domain).toLowerCase() : null;
+  const filterQuery = args.query ? String(args.query).toLowerCase().trim() : null;
   const rawLimit = Number(args.limit ?? 50);
-  const limit = isNaN(rawLimit) ? 50 : Math.max(1, rawLimit);
+  const limit = isNaN(rawLimit) ? 50 : Math.min(Math.max(1, rawLimit), 500);
 
   const { meetings: all, truncated } = await fetchAllMeetings(dateParams, apiKey);
 
   const filtered = all.filter((m) => {
-    if (!filterEmail && !filterDomain) return true;
     const invitees = m.calendar_invitees ?? [];
     const allEmails = [
       ...invitees.map((i) => i.email.toLowerCase()),
       ...(m.recorded_by?.email ? [m.recorded_by.email.toLowerCase()] : []),
     ];
+
     if (filterEmail && !allEmails.includes(filterEmail)) return false;
     if (filterDomain && !allEmails.some((e) => e.endsWith(`@${filterDomain}`))) return false;
+
+    if (filterQuery) {
+      const title = (m.meeting_title ?? m.title ?? "").toLowerCase();
+      const attendeeText = [
+        ...invitees.map((i) => `${i.name} ${i.email}`.toLowerCase()),
+        m.recorded_by ? `${m.recorded_by.name} ${m.recorded_by.email}`.toLowerCase() : "",
+      ].join(" ");
+
+      // Email exact match
+      if (filterQuery.includes("@")) {
+        return allEmails.includes(filterQuery);
+      }
+      // Domain match
+      if (filterQuery.includes(".") && !filterQuery.includes(" ")) {
+        return allEmails.some((e) => e.endsWith(`@${filterQuery}`));
+      }
+      // Title or attendee name/email substring
+      return title.includes(filterQuery) || attendeeText.includes(filterQuery);
+    }
+
     return true;
   });
 
@@ -302,14 +333,24 @@ async function handleListMeetings(
 
   const results = filtered.slice(0, limit);
   const lines = results.map(formatMeetingLine);
-  const truncNote = truncated
-    ? `\n\n(Results may be incomplete — search was capped at 500 meetings. Narrow the range with created_after/created_before.)`
-    : "";
-  const limitNote = filtered.length > limit
-    ? `\n\n(Showing ${limit} of ${filtered.length} matches. Narrow the range with created_after/created_before.)`
-    : "";
 
-  return `Found ${filtered.length} meeting(s):\n\n${lines.join("\n")}${limitNote}${truncNote}`;
+  const notes: string[] = [];
+  if (filtered.length > limit)
+    notes.push(`Showing ${limit} of ${filtered.length} matches. Pass a higher limit or narrow with created_after/created_before.`);
+  if (truncated)
+    notes.push(`Search pool capped at 500 meetings. Results may be incomplete for accounts with large history — narrow the date range to ensure full coverage.`);
+
+  const noteStr = notes.length ? `\n\n(${notes.join(" ")})` : "";
+  return `Found ${filtered.length} meeting(s):\n\n${lines.join("\n")}${noteStr}`;
+}
+
+async function handleSearchMeetings(
+  args: Record<string, unknown>,
+  apiKey: string
+): Promise<string> {
+  // search_meetings is now an alias for list_meetings with query support.
+  // Kept for backwards compatibility with any cached tool lists.
+  return handleListMeetings(args, apiKey);
 }
 
 async function handleGetTranscript(
@@ -368,82 +409,22 @@ async function handleGetSummary(
   return `# Summary (recording ${id})${templateNote}\n\n${markdown_formatted}`;
 }
 
-async function handleSearchMeetings(
-  args: Record<string, unknown>,
-  apiKey: string
-): Promise<string> {
-  const errors: ValidationError[] = [];
-  const qError = validateSearchQuery(args.query, "query");
-  const e1 = validateIso8601(args.created_after, "created_after");
-  const e2 = validateIso8601(args.created_before, "created_before");
-  if (qError) errors.push(qError);
-  if (e1) errors.push(e1);
-  if (e2) errors.push(e2);
-  if (errors.length)
-    return `Invalid arguments:\n${errors.map((e) => `- ${e.message}`).join("\n")}`;
-
-  const query = String(args.query).toLowerCase().trim();
-
-  const dateParams: Record<string, string> = {};
-  if (args.created_after) dateParams.created_after = String(args.created_after);
-  if (args.created_before) dateParams.created_before = String(args.created_before);
-
-  // Fetch all pages client-side — Fathom server-side filters are unreliable
-  const { meetings: all, truncated } = await fetchAllMeetings(dateParams, apiKey);
-
-  const filtered = all.filter((m) => {
-    const title = (m.meeting_title ?? m.title ?? "").toLowerCase();
-    const invitees = m.calendar_invitees ?? [];
-    const attendeeText = invitees.map((i) => `${i.name} ${i.email}`.toLowerCase()).join(" ");
-
-    if (query.includes("@")) {
-      return invitees.some((i) => i.email.toLowerCase() === query);
-    }
-    if (query.includes(".") && !query.includes(" ")) {
-      return invitees.some((i) => i.email.toLowerCase().endsWith(`@${query}`));
-    }
-    return title.includes(query) || attendeeText.includes(query);
-  });
-
-  if (!filtered.length) return `No meetings found matching "${args.query}".`;
-
-  const lines = filtered.map(formatMeetingLine);
-  const truncNote = truncated
-    ? `\n\n(Results may be incomplete — search was capped at 500 meetings. Narrow the range with created_after/created_before.)`
-    : "";
-
-  return `Found ${filtered.length} meeting(s) matching "${args.query}":\n\n${lines.join("\n")}${truncNote}`;
-}
-
-// ── MCP protocol ──────────────────────────────────────────────────────────────
-
-interface MCPRequest {
-  jsonrpc: "2.0";
-  id: string | number | null;
-  method: string;
-  params?: Record<string, unknown>;
-}
-
-interface MCPResponse {
-  jsonrpc: "2.0";
-  id: string | number | null;
-  result?: unknown;
-  error?: { code: number; message: string };
-}
-
 const TOOLS = [
   {
     name: "list_meetings",
     description:
-      "List Fathom meetings with optional filters. Use this to find a meeting before fetching its transcript or summary. Returns meeting IDs, titles, dates, and attendees.",
+      "List and search Fathom meetings. Supports filtering by date range, attendee email, attendee domain, and free-text query (matches meeting title and attendee names). " +
+      "Always use created_after/created_before to narrow results — the search pool is capped at 500 meetings per call. " +
+      "For large date ranges, make multiple calls with monthly windows.",
     inputSchema: {
       type: "object",
       properties: {
-        created_after: { type: "string", description: "ISO 8601 datetime, e.g. 2024-01-01T00:00:00Z" },
-        created_before: { type: "string", description: "ISO 8601 datetime, e.g. 2024-12-31T23:59:59Z" },
-        invitee_email: { type: "string", description: "Filter by attendee email address, e.g. john@acme.com" },
+        created_after:  { type: "string", description: "ISO 8601 date or datetime, e.g. 2025-01-01 or 2025-01-01T00:00:00Z" },
+        created_before: { type: "string", description: "ISO 8601 date or datetime, e.g. 2025-03-31 or 2025-03-31T23:59:59Z" },
+        invitee_email:  { type: "string", description: "Filter by exact attendee email, e.g. john@acme.com" },
         invitee_domain: { type: "string", description: "Filter by attendee email domain, e.g. acme.com" },
-        limit: { type: "number", description: "Max meetings to return (default 50, max 500)" },
+        query:          { type: "string", description: "Free-text search across meeting titles and attendee names/emails, e.g. 'National Catholic Reporter' or 'john@acme.com'" },
+        limit:          { type: "number", description: "Max results to return (default 50, max 500)" },
       },
     },
   },
@@ -471,18 +452,34 @@ const TOOLS = [
   },
   {
     name: "search_meetings",
-    description: "Search for meetings by attendee name, email, or company domain. Returns matching meetings with their IDs and titles.",
+    description: "Alias for list_meetings with query support. Prefer list_meetings. Accepts the same parameters.",
     inputSchema: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Name, email address, or domain to search for, e.g. 'John Smith', 'john@acme.com', or 'acme.com'" },
-        created_after: { type: "string", description: "Optionally narrow by date range (ISO 8601)" },
-        created_before: { type: "string", description: "Optionally narrow by date range (ISO 8601)" },
+        query:          { type: "string", description: "Free-text search across meeting titles and attendee names/emails" },
+        created_after:  { type: "string", description: "ISO 8601 date or datetime" },
+        created_before: { type: "string", description: "ISO 8601 date or datetime" },
+        invitee_email:  { type: "string", description: "Filter by exact attendee email" },
+        invitee_domain: { type: "string", description: "Filter by attendee email domain" },
+        limit:          { type: "number", description: "Max results to return (default 50, max 500)" },
       },
-      required: ["query"],
     },
   },
 ];
+
+interface MCPRequest {
+  jsonrpc: "2.0";
+  id: string | number | null;
+  method: string;
+  params?: Record<string, unknown>;
+}
+
+interface MCPResponse {
+  jsonrpc: "2.0";
+  id: string | number | null;
+  result?: unknown;
+  error?: { code: number; message: string };
+}
 
 function mcpOk(id: string | number | null, result: unknown): MCPResponse {
   return { jsonrpc: "2.0", id, result };
