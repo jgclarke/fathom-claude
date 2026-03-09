@@ -306,7 +306,12 @@ async function handleListMeetings(
   const dateParams: Record<string, string> = {};
   const after = normalizeDate(args.created_after);
   const before = normalizeDate(args.created_before);
-  if (after) dateParams.created_after = after;
+
+  // Default to 6 months back if no created_after supplied — prevents unbounded
+  // pagination through entire account history, which hits Fathom's 60 req/min limit.
+  const sixMonthsAgo = new Date();
+  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+  dateParams.created_after = after ?? sixMonthsAgo.toISOString();
   if (before) dateParams.created_before = before;
 
   const filterEmail = args.invitee_email ? String(args.invitee_email).toLowerCase() : null;
@@ -434,8 +439,8 @@ const TOOLS = [
     name: "list_meetings",
     description:
       "List and search Fathom meetings. Supports filtering by date range, attendee email, attendee domain, and free-text query (matches meeting title and attendee names). " +
-      "Use created_after/created_before to scope results to a specific time window. " +
-      "Without date filters, searches across your full account history.",
+      "Defaults to the last 6 months if no date range is supplied. " +
+      "To search further back, pass created_after with an earlier date.",
     inputSchema: {
       type: "object",
       properties: {
