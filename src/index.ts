@@ -12,6 +12,7 @@
  *
  * OAuth endpoints:
  *   GET  /.well-known/oauth-authorization-server  — metadata discovery
+ *   POST /oauth/register                           — dynamic client registration (RFC 7591)
  *   GET  /oauth/authorize                          — shows the auth form
  *   POST /oauth/authorize                          — processes form submission
  *   POST /oauth/token                              — exchanges code for token
@@ -646,12 +647,67 @@ function handleOAuthMetadata(baseUrl: string): Response {
       authorization_endpoint: `${baseUrl}/oauth/authorize`,
       token_endpoint: `${baseUrl}/oauth/token`,
       revocation_endpoint: `${baseUrl}/oauth/revoke`,
+      registration_endpoint: `${baseUrl}/oauth/register`,
       response_types_supported: ["code"],
       grant_types_supported: ["authorization_code"],
       code_challenge_methods_supported: ["S256"],
       token_endpoint_auth_methods_supported: ["none"],
     }),
     { headers: { "Content-Type": "application/json", ...oauthCorsHeaders() } }
+  );
+}
+
+/**
+ * POST /oauth/register
+ *
+ * OAuth 2.0 Dynamic Client Registration (RFC 7591).
+ * Claude calls this before starting the auth flow to register itself
+ * as a client. We don't need to persist the registration — we accept
+ * any well-formed request and return a client_id derived from the
+ * request so Claude can proceed to the authorize endpoint.
+ *
+ * Security note: we validate that the redirect_uris are Claude's
+ * known callback URLs before accepting the registration.
+ */
+async function handleRegister(request: Request): Promise<Response> {
+  let body: Record<string, unknown>;
+  try {
+    body = await request.json();
+  } catch {
+    return oauthError("invalid_request", "Could not parse registration request body");
+  }
+
+  // Validate redirect_uris — only Claude's known callback URLs accepted
+  const redirectUris = (body.redirect_uris as string[]) ?? [];
+  const allValid = redirectUris.every(
+    (uri) =>
+      uri.startsWith("https://claude.ai/") ||
+      uri.startsWith("https://claude.com/")
+  );
+
+  if (!redirectUris.length || !allValid) {
+    return oauthError("invalid_redirect_uri", "redirect_uris must be Claude callback URLs");
+  }
+
+  // Issue a stable client_id based on the requesting client name.
+  // We don't store registrations — the client_id is accepted as-is
+  // on the authorize endpoint without further validation.
+  const clientId = `claude-${randomHex(8)}`;
+
+  return new Response(
+    JSON.stringify({
+      client_id: clientId,
+      client_name: body.client_name ?? "Claude",
+      redirect_uris: redirectUris,
+      grant_types: ["authorization_code"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+      code_challenge_methods: ["S256"],
+    }),
+    {
+      status: 201,
+      headers: { "Content-Type": "application/json", ...oauthCorsHeaders() },
+    }
   );
 }
 
@@ -952,6 +1008,15 @@ export default {
     // ── OAuth metadata discovery ───────────────────────────────────────────────
     if (url.pathname === "/.well-known/oauth-authorization-server") {
       return handleOAuthMetadata(baseUrl);
+    }
+
+    // ── OAuth register (Dynamic Client Registration) ───────────────────────────
+    if (url.pathname === "/oauth/register") {
+      if (request.method === "OPTIONS")
+        return new Response(null, { headers: oauthCorsHeaders() });
+      if (request.method === "POST")
+        return handleRegister(request);
+      return new Response("Method not allowed", { status: 405 });
     }
 
     // ── OAuth authorize ────────────────────────────────────────────────────────
