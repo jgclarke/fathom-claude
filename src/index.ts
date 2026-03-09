@@ -211,22 +211,34 @@ interface FathomMeeting {
 // ── Tool handlers ─────────────────────────────────────────────────────────────
 
 /**
- * Fetches ALL meetings from Fathom by following pagination cursors.
- * Fathom's server-side filters (invitee_domain, invitee_email) are unreliable
- * so we fetch everything and filter client-side.
- * Date range params are still sent to the API as those appear to work correctly.
+ * Fetches meetings from Fathom by following pagination cursors.
+ *
+ * The Fathom API ignores server-side filters (invitee_domain, invitee_email,
+ * created_after, created_before), so we fetch everything and filter client-side.
+ *
+ * Pagination stops when:
+ *   - There is no next_cursor (end of account history)
+ *   - The oldest meeting on a page is earlier than `stopBefore` (we've passed the window)
+ *   - A hard safety cap of 100 pages (5000 meetings) is hit
  */
 async function fetchAllMeetings(
   dateParams: Record<string, string>,
   apiKey: string,
-  maxPages = 10
 ): Promise<{ meetings: FathomMeeting[]; truncated: boolean }> {
   const all: FathomMeeting[] = [];
   let cursor: string | undefined;
+  const SAFETY_CAP = 100; // 100 pages × 50 = 5000 meetings max
   let pagesFetched = 0;
 
-  while (pagesFetched < maxPages) {
-    const params: Record<string, string> = { limit: "50", ...dateParams };
+  // If caller supplied a created_after bound, stop paginating once we've
+  // gone past it — meetings are returned newest-first so once we see a
+  // meeting older than this we know there's nothing relevant further back.
+  const stopBefore = dateParams.created_after
+    ? new Date(dateParams.created_after).getTime()
+    : null;
+
+  while (pagesFetched < SAFETY_CAP) {
+    const params: Record<string, string> = { limit: "50" };
     if (cursor) params.cursor = cursor;
 
     const data = (await fathomGet("/meetings", params, apiKey)) as {
@@ -236,14 +248,22 @@ async function fetchAllMeetings(
 
     if (!data.items?.length) break;
     all.push(...data.items);
+    pagesFetched++;
+
+    // If the oldest meeting on this page is before our window, we're done.
+    if (stopBefore) {
+      const oldest = data.items[data.items.length - 1];
+      const oldestTime = new Date(
+        oldest.scheduled_start_time ?? oldest.created_at
+      ).getTime();
+      if (oldestTime < stopBefore) break;
+    }
+
     if (!data.next_cursor) break;
     cursor = data.next_cursor;
-    pagesFetched++;
   }
 
-  // If we exited because we hit maxPages AND there was still a next_cursor on
-  // the last page, results were silently truncated — flag it for callers.
-  const truncated = pagesFetched >= maxPages;
+  const truncated = pagesFetched >= SAFETY_CAP;
   return { meetings: all, truncated };
 }
 
@@ -338,7 +358,7 @@ async function handleListMeetings(
   if (filtered.length > limit)
     notes.push(`Showing ${limit} of ${filtered.length} matches. Pass a higher limit or narrow with created_after/created_before.`);
   if (truncated)
-    notes.push(`Search pool capped at 500 meetings. Results may be incomplete for accounts with large history — narrow the date range to ensure full coverage.`);
+    notes.push(`Search pool capped at 5000 meetings. Results may be incomplete — narrow the date range to ensure full coverage.`);
 
   const noteStr = notes.length ? `\n\n(${notes.join(" ")})` : "";
   return `Found ${filtered.length} meeting(s):\n\n${lines.join("\n")}${noteStr}`;
@@ -414,8 +434,8 @@ const TOOLS = [
     name: "list_meetings",
     description:
       "List and search Fathom meetings. Supports filtering by date range, attendee email, attendee domain, and free-text query (matches meeting title and attendee names). " +
-      "Always use created_after/created_before to narrow results — the search pool is capped at 500 meetings per call. " +
-      "For large date ranges, make multiple calls with monthly windows.",
+      "Use created_after/created_before to scope results to a specific time window. " +
+      "Without date filters, searches across your full account history.",
     inputSchema: {
       type: "object",
       properties: {
