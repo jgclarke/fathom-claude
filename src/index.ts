@@ -87,7 +87,8 @@ async function verifyPKCE(verifier: string, challenge: string): Promise<boolean>
 
 // ── Input validation ──────────────────────────────────────────────────────────
 
-const ISO8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+// Accepts: 2024-01-01T00:00:00Z, 2024-01-01T00:00:00.000Z, 2024-01-01T00:00:00-05:00, 2024-01-01
+const ISO8601_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2}))?$/;
 const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,255}$/;
 const DOMAIN_RE = /^[a-zA-Z0-9][a-zA-Z0-9.-]{0,253}[a-zA-Z0-9]$/;
 const RECORDING_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
@@ -288,8 +289,12 @@ async function handleListMeetings(
   const filtered = all.filter((m) => {
     if (!filterEmail && !filterDomain) return true;
     const invitees = m.calendar_invitees ?? [];
-    if (filterEmail) return invitees.some((i) => i.email.toLowerCase() === filterEmail);
-    if (filterDomain) return invitees.some((i) => i.email.toLowerCase().endsWith(`@${filterDomain}`));
+    const allEmails = [
+      ...invitees.map((i) => i.email.toLowerCase()),
+      ...(m.recorded_by?.email ? [m.recorded_by.email.toLowerCase()] : []),
+    ];
+    if (filterEmail && !allEmails.includes(filterEmail)) return false;
+    if (filterDomain && !allEmails.some((e) => e.endsWith(`@${filterDomain}`))) return false;
     return true;
   });
 
@@ -438,7 +443,7 @@ const TOOLS = [
         created_before: { type: "string", description: "ISO 8601 datetime, e.g. 2024-12-31T23:59:59Z" },
         invitee_email: { type: "string", description: "Filter by attendee email address, e.g. john@acme.com" },
         invitee_domain: { type: "string", description: "Filter by attendee email domain, e.g. acme.com" },
-        limit: { type: "number", description: "Number of meetings to return (default 10, max 50)" },
+        limit: { type: "number", description: "Max meetings to return (default 50, max 500)" },
       },
     },
   },
