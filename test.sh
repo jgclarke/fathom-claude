@@ -42,7 +42,7 @@ if [[ $# -gt 0 ]]; then
         obj[field] = isNaN(val) ? val : Number(val);
       }
       console.log(JSON.stringify(obj));
-    " "$@")
+    " -- "$@")
   else
     # Raw JSON — strip control characters that sneak in via copy-paste
     ARGS=$(printf '%s' "$first" | tr -d '\n\r\t')
