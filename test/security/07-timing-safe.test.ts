@@ -43,4 +43,18 @@ describe("07 — Timing-safe comparison", () => {
     const b = "B" + "x".repeat(999);
     expect(timingSafeEqual(a, b)).toBe(false);
   });
+
+  it("length-mismatch branch XORs real bytes (not ^ 0 no-op)", () => {
+    // Previously the length-mismatch branch did `diff |= charCodeAt(i) ^ 0`
+    // which is a no-op (any value XOR 0 = itself, never changes diff meaningfully
+    // because we still return false). The real bug is that it leaked timing:
+    // the loop only ran over `a.length` with no comparison to `b`.
+    // The fix pads both byte arrays to max(a.length, b.length) and XORs them.
+    // Verify: different-length strings with identical prefix are still false.
+    expect(timingSafeEqual("abc", "abcd")).toBe(false);
+    expect(timingSafeEqual("abcd", "abc")).toBe(false);
+    // And crucially: the length difference itself is included in the XOR accumulator,
+    // so length(3) ^ length(4) = 7 != 0 → always false even if bytes all match.
+    expect(timingSafeEqual("abc", "abc\x00")).toBe(false); // \x00 padded byte
+  });
 });

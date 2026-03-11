@@ -3,11 +3,14 @@ import { SELF } from "cloudflare:test";
 import { seedToken, mcpPost, FAKE_TOKEN, INITIALIZE_MSG } from "../helpers";
 
 describe("05 — CORS: MCP endpoint", () => {
-  it("POST /mcp ACAO is exactly 'null' (not wildcard)", async () => {
+  it("POST /mcp has no ACAO header (server-to-server, no CORS needed)", async () => {
+    // MCP is server-to-server. Sending 'null' as ACAO can widen attack surface
+    // (some browsers treat it as a wildcard for null-origin requests).
+    // The correct posture is no ACAO header on actual POST responses.
     await seedToken();
     const res = await SELF.fetch(mcpPost(FAKE_TOKEN, INITIALIZE_MSG));
     const acao = res.headers.get("Access-Control-Allow-Origin");
-    expect(acao).toBe("null");
+    expect(acao).toBeNull();
     expect(acao).not.toBe("*");
   });
 

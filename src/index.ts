@@ -24,7 +24,7 @@
  *
  * KV schema:
  *   auth_code:<code>   → JSON { fathomApiKey, codeChallenge, expiresAt }  TTL: 5 min
- *   token:<token>      → JSON { fathomApiKey, issuedAt }                  TTL: 90 days
+ *   token:<token>      → JSON { fathomApiKey, issuedAt }                  TTL: 30 days
  */
 
 const FATHOM_BASE = "https://api.fathom.ai/external/v1";
@@ -39,8 +39,6 @@ const ACCESS_TOKEN_TTL_SECONDS = 2592000; // 30 days
 interface Env {
   // KV namespace bound in wrangler.toml as [[kv_namespaces]] binding = "FATHOM_KV"
   FATHOM_KV: KVNamespace;
-  // Set to "true" in .dev.vars for local testing (never set in production)
-  DEV_MODE?: string;
 }
 
 // ── Crypto helpers ────────────────────────────────────────────────────────────
@@ -60,14 +58,15 @@ function randomHex(bytes: number): string {
  * character by character.
  */
 function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) {
-    let diff = 0;
-    for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ 0;
-    return false;
-  }
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  const len = Math.max(ab.length, bb.length);
+  // Include length mismatch in diff so unequal-length strings always return false,
+  // while still iterating over the full longer string to avoid timing leaks.
+  let diff = ab.length ^ bb.length;
+  for (let i = 0; i < len; i++) {
+    diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0);
   }
   return diff === 0;
 }
@@ -962,9 +961,10 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
     return oauthError("invalid_request", "code and code_verifier are required");
   }
 
-  // Look up and immediately delete the auth code — single use
+  // Look up the auth code — do NOT delete yet; wait until PKCE passes
+  // to prevent a DoS where an attacker burns a legitimate code before the
+  // real client can complete the exchange.
   const stored = await env.FATHOM_KV.get(`auth_code:${code}`);
-  await env.FATHOM_KV.delete(`auth_code:${code}`);
 
   if (!stored) {
     return oauthError("invalid_grant", "Authorization code is invalid or expired");
@@ -977,11 +977,14 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
     return oauthError("server_error", "Internal error");
   }
 
-  // Verify PKCE
+  // Verify PKCE before consuming the code
   const pkceValid = await verifyPKCE(codeVerifier, codeData.codeChallenge);
   if (!pkceValid) {
     return oauthError("invalid_grant", "PKCE verification failed");
   }
+
+  // PKCE passed — now consume the auth code (single use)
+  await env.FATHOM_KV.delete(`auth_code:${code}`);
 
   // Issue access token
   const accessToken = randomHex(32); // 256 bits of entropy
@@ -1125,16 +1128,8 @@ export default {
       if (request.method === "OPTIONS")
         return new Response(null, { headers: mcpCorsHeaders() });
 
-      // Resolve the Fathom API key.
-      // In local dev (DEV_MODE=true in .dev.vars), accept key directly via header.
-      // In production, always require a valid Bearer token from the OAuth flow.
-      let fathomApiKey: string | null = null;
-      if (env.DEV_MODE === "true") {
-        fathomApiKey = request.headers.get("X-Fathom-Key");
-      }
-      if (!fathomApiKey) {
-        fathomApiKey = await resolveBearerToken(request, env);
-      }
+      // Resolve the Fathom API key via Bearer token from the OAuth flow.
+      const fathomApiKey = await resolveBearerToken(request, env);
       if (!fathomApiKey) {
         return new Response(
           JSON.stringify({ error: "Unauthorized. Connect via Claude's Connectors settings." }),
@@ -1154,7 +1149,7 @@ export default {
         }
         const response = await handleMCP(body, fathomApiKey);
         return new Response(JSON.stringify(response), {
-          headers: { "Content-Type": "application/json", ...mcpCorsHeaders() },
+          headers: { "Content-Type": "application/json" },
         });
       }
 
@@ -1185,7 +1180,6 @@ export default {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
-            ...mcpCorsHeaders(),
           },
         });
       }

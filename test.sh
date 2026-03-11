@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 # Local MCP test script.
-# Usage: FATHOM_KEY=your_key ./test.sh [tool] [args]
+# Usage: BEARER_TOKEN=your_token ./test.sh [tool] [args]
 #
 # Prerequisites: wrangler dev must be running in another terminal:
 #   npm run dev
 #
+# Obtain a Bearer token by going through the OAuth flow locally:
+#   http://localhost:8787/oauth/authorize?...
+# Or use the deployed app's token from Claude's Connectors settings.
+#
 # Simple named-arg form (recommended — avoids JSON quoting issues):
-#   FATHOM_KEY=xxx ./test.sh list_meetings
-#   FATHOM_KEY=xxx ./test.sh list_meetings --query "National Catholic Reporter"
-#   FATHOM_KEY=xxx ./test.sh list_meetings --query "acme" --limit 5
-#   FATHOM_KEY=xxx ./test.sh list_meetings --after 2025-01-01 --before 2025-03-31
-#   FATHOM_KEY=xxx ./test.sh get_transcript --id abc123
-#   FATHOM_KEY=xxx ./test.sh get_summary --id abc123
+#   BEARER_TOKEN=xxx ./test.sh list_meetings
+#   BEARER_TOKEN=xxx ./test.sh list_meetings --query "National Catholic Reporter"
+#   BEARER_TOKEN=xxx ./test.sh list_meetings --query "acme" --limit 5
+#   BEARER_TOKEN=xxx ./test.sh list_meetings --after 2025-01-01 --before 2025-03-31
+#   BEARER_TOKEN=xxx ./test.sh get_transcript --id abc123
+#   BEARER_TOKEN=xxx ./test.sh get_summary --id abc123
 #
 # Raw JSON form:
-#   FATHOM_KEY=xxx ./test.sh list_meetings '{"limit":5}'
+#   BEARER_TOKEN=xxx ./test.sh list_meetings '{"limit":5}'
 
 set -euo pipefail
 
 BASE="http://localhost:8787/mcp"
-KEY="${FATHOM_KEY:?Set FATHOM_KEY=your_fathom_api_key}"
+TOKEN="${BEARER_TOKEN:?Set BEARER_TOKEN=your_oauth_bearer_token}"
 TOOL="${1:-}"
 shift || true
 
@@ -67,7 +71,7 @@ mcp_call() {
   echo "Sending: $(echo "$body" | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8');console.log(JSON.stringify(JSON.parse(d),null,2))")" >&2
   curl -s --max-time 30 -X POST "$BASE" \
     -H "Content-Type: application/json" \
-    -H "X-Fathom-Key: $KEY" \
+    -H "Authorization: Bearer $TOKEN" \
     -d "$body" \
     | node -e "const d=require('fs').readFileSync('/dev/stdin','utf8');console.log(JSON.stringify(JSON.parse(d),null,2))"
 }
