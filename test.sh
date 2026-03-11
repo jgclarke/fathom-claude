@@ -7,7 +7,7 @@
 #
 # Examples:
 #   FATHOM_KEY=xxx ./test.sh
-#   FATHOM_KEY=xxx ./test.sh list_meetings '{}'
+#   FATHOM_KEY=xxx ./test.sh list_meetings
 #   FATHOM_KEY=xxx ./test.sh list_meetings '{"query":"acme","limit":5}'
 #   FATHOM_KEY=xxx ./test.sh get_transcript '{"recording_id":"abc123"}'
 #   FATHOM_KEY=xxx ./test.sh get_summary '{"recording_id":"abc123"}'
@@ -21,11 +21,18 @@ ARGS="${2:-{}}"
 
 mcp_call() {
   local method="$1"
-  local params="$2"
+  local params_json="$2"
+  # Use jq to safely construct the body — avoids shell quoting issues
+  local body
+  body=$(jq -n \
+    --arg method "$method" \
+    --argjson params "$params_json" \
+    '{"jsonrpc":"2.0","id":1,"method":$method,"params":$params}')
+  echo "Sending: $body" >&2
   curl -s -X POST "$BASE" \
     -H "Content-Type: application/json" \
     -H "X-Fathom-Key: $KEY" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"$method\",\"params\":$params}" \
+    -d "$body" \
     | jq .
 }
 
@@ -39,5 +46,8 @@ mcp_call "tools/list" '{}'
 if [[ -n "$TOOL" ]]; then
   echo ""
   echo "=== tools/call: $TOOL ==="
-  mcp_call "tools/call" "{\"name\":\"$TOOL\",\"arguments\":$ARGS}"
+  # Use jq to build the params object safely
+  tool_params=$(jq -n --arg name "$TOOL" --argjson args "$ARGS" \
+    '{"name":$name,"arguments":$args}')
+  mcp_call "tools/call" "$tool_params"
 fi
