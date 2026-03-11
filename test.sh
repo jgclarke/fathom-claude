@@ -84,7 +84,11 @@ if [[ -n "$TOOL" ]]; then
   echo "=== tools/call: $TOOL ==="
   tool_params=$(node -e "
     const name = process.argv[1];
-    const args = JSON.parse(process.argv[2]);
+    let args = JSON.parse(process.argv[2]);
+    // If get_transcript/get_summary is called with a bare ID, wrap it
+    if ((name === 'get_transcript' || name === 'get_summary') && typeof args !== 'object') {
+      args = { recording_id: String(args) };
+    }
     console.log(JSON.stringify({name, arguments:args}));
   " "$TOOL" "$ARGS")
   mcp_call "tools/call" "$tool_params"
