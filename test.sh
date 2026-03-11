@@ -38,9 +38,9 @@ if [[ $# -gt 0 ]]; then
         // Map short names to API field names
         const fieldMap = { id: 'recording_id', after: 'created_after', before: 'created_before' };
         const field = fieldMap[key] || key;
-        // Normalize whitespace (strip newlines from copy-paste), coerce numbers
+        // Normalize whitespace; only coerce 'limit' to a number, rest stay as strings
         const clean = val.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
-        obj[field] = isNaN(clean) ? clean : Number(clean);
+        obj[field] = field === 'limit' && !isNaN(clean) ? Number(clean) : clean;
       }
       console.log(JSON.stringify(obj));
     " -- "$@")
