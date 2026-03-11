@@ -61,8 +61,8 @@ To disconnect Claude from your Fathom account, go to **Settings → Connectors**
 - **OAuth 2.0 with PKCE.** Authentication follows the standard authorization code flow. PKCE prevents auth code interception attacks.
 - **Fathom API keys are validated before storage.** An invalid key is rejected at the form — it is never stored.
 - **Tokens are 256-bit random values** stored in Cloudflare KV. They are not guessable or derivable from any public information.
-- **Auth codes are single-use and expire in 5 minutes.** They are deleted immediately upon exchange.
-- **Access tokens expire after 90 days.** Users can revoke them at any time via Claude's connector settings.
+- **Auth codes are single-use and expire in 5 minutes.** They are deleted only after PKCE verification succeeds.
+- **Access tokens expire after 30 days.** Users can revoke them at any time via Claude's connector settings.
 - **The Worker URL is not published in this README.** Distribute it privately to reduce the attack surface.
 - **All input is validated** before being forwarded to Fathom's API.
 - **Upstream error bodies are discarded.** Only safe, normalized error messages are returned to Claude.
@@ -86,21 +86,39 @@ In the [Cloudflare dashboard](https://dash.cloudflare.com):
 3. Name it `fathom-mcp-tokens` (or anything you like)
 4. Copy the **Namespace ID**
 
-### Step 2: Add the KV ID to wrangler.toml
+### Step 2: Configure your KV namespace IDs
 
-Open `wrangler.toml` and replace `PASTE_YOUR_KV_NAMESPACE_ID_HERE` with the ID you just copied:
+`wrangler.toml` contains placeholder values and is safe to commit. Your real namespace IDs go in a local file that is gitignored:
+
+```bash
+cp wrangler.local.toml.example wrangler.local.toml   # if the example exists
+# or create wrangler.local.toml manually (see below)
+```
+
+Create `wrangler.local.toml` in the repo root (it is gitignored — never commit it):
 
 ```toml
+name = "fathom-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
 [[kv_namespaces]]
 binding = "FATHOM_KV"
-id = "your-actual-namespace-id-here"
+id = "your-production-namespace-id"
+preview_id = "your-preview-namespace-id"
 ```
+
+For a preview namespace (used by `npm run dev`), create a second namespace in the Cloudflare dashboard named `fathom-mcp-tokens-preview` and paste its ID as `preview_id`.
 
 ### Step 3: Deploy
 
 ```bash
 npm install
-npm run deploy
+npx wrangler deploy --config wrangler.local.toml
 ```
 
 Wrangler will output your Worker URL. Share it privately with team members — do not put it in this README.
@@ -111,14 +129,7 @@ Wrangler will output your Worker URL. Share it privately with team members — d
 npm run dev
 ```
 
-Local dev doesn't have access to production KV. To test OAuth locally, create a preview KV namespace in the Cloudflare dashboard and add it to wrangler.toml:
-
-```toml
-[[kv_namespaces]]
-binding = "FATHOM_KV"
-id = "your-production-id"
-preview_id = "your-preview-id"
-```
+This uses the `preview_id` from `wrangler.local.toml`. The automated test suite (`npm test`) runs against an in-memory KV and does not require a live Cloudflare namespace.
 
 ### Rotating / revoking tokens
 
@@ -141,7 +152,7 @@ Zero-downtime. Existing tokens continue to work after redeploy.
 
 **"That API key wasn't accepted"** — Check the key in Fathom Settings → API Access. Regenerate if needed.
 
-**"Unauthorized"** in Claude — Your token may have expired (90 days) or been revoked. Remove and re-add the connector.
+**"Unauthorized"** in Claude — Your token may have expired (30 days) or been revoked. Remove and re-add the connector.
 
 **Connector shows as disconnected** — Remove and re-add the connector in Claude Settings.
 
