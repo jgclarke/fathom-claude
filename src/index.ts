@@ -238,7 +238,9 @@ async function fetchAllMeetings(
   const all: FathomMeeting[] = [];
   let cursor: string | undefined;
   const SAFETY_CAP = 100; // 100 pages × 50 = 5000 meetings max
-  const DEADLINE_MS = Date.now() + 20_000; // stop after 20 s to stay under 30 s Worker timeout
+  // performance.now() advances during awaits in Workers; Date.now() is frozen at request start.
+  const startedAt = performance.now();
+  const BUDGET_MS = 20_000; // stop after 20 s to stay under 30 s Worker timeout
   let pagesFetched = 0;
 
   // If caller supplied a created_after bound, stop paginating once we've
@@ -248,7 +250,7 @@ async function fetchAllMeetings(
     ? new Date(dateParams.created_after).getTime()
     : null;
 
-  while (pagesFetched < SAFETY_CAP && Date.now() < DEADLINE_MS) {
+  while (pagesFetched < SAFETY_CAP && performance.now() - startedAt < BUDGET_MS) {
     const params: Record<string, string> = { limit: "50" };
     if (cursor) params.cursor = cursor;
 
@@ -274,7 +276,7 @@ async function fetchAllMeetings(
     cursor = data.next_cursor;
   }
 
-  const truncated = pagesFetched >= SAFETY_CAP || Date.now() >= DEADLINE_MS;
+  const truncated = pagesFetched >= SAFETY_CAP || performance.now() - startedAt >= BUDGET_MS;
   return { meetings: all, truncated };
 }
 
