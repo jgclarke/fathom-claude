@@ -30,7 +30,7 @@ if [[ $# -gt 0 ]]; then
   if [[ "$first" == --* ]]; then
     # Named-flag mode: build JSON from --key value pairs
     ARGS=$(node -e "
-      const argv = process.argv.slice(1);
+      const argv = process.argv.slice(1).filter(a => a !== '--');
       const obj = {};
       for (let i = 0; i < argv.length; i += 2) {
         const key = argv[i].replace(/^--/, '');
