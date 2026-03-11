@@ -39,6 +39,8 @@ const ACCESS_TOKEN_TTL_SECONDS = 2592000; // 30 days
 interface Env {
   // KV namespace bound in wrangler.toml as [[kv_namespaces]] binding = "FATHOM_KV"
   FATHOM_KV: KVNamespace;
+  // 64-char hex (32-byte AES-256-GCM key). Set via: wrangler secret put KV_ENCRYPTION_KEY
+  KV_ENCRYPTION_KEY: string;
 }
 
 // ── Crypto helpers ────────────────────────────────────────────────────────────
@@ -84,6 +86,50 @@ async function verifyPKCE(verifier: string, challenge: string): Promise<boolean>
     .replace(/\//g, "_")
     .replace(/=+$/, "");
   return timingSafeEqual(base64url, challenge);
+}
+
+/**
+ * AES-256-GCM encryption for Fathom API keys at rest in KV.
+ * The encryption key is a Wrangler secret, never stored in KV itself.
+ * Ciphertext format: base64(12-byte IV || GCM ciphertext || 16-byte auth tag).
+ */
+function hexToBytes(hex: string): Uint8Array {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.slice(i, i + 2), 16);
+  }
+  return bytes;
+}
+
+async function encryptValue(plaintext: string, keyHex: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw", hexToBytes(keyHex), { name: "AES-GCM" }, false, ["encrypt"]
+  );
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv }, key, new TextEncoder().encode(plaintext)
+  );
+  const combined = new Uint8Array(12 + ciphertext.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(ciphertext), 12);
+  let binary = "";
+  for (let i = 0; i < combined.length; i++) binary += String.fromCharCode(combined[i]);
+  return btoa(binary);
+}
+
+async function decryptValue(encrypted: string, keyHex: string): Promise<string | null> {
+  try {
+    const combined = Uint8Array.from(atob(encrypted), (c) => c.charCodeAt(0));
+    const key = await crypto.subtle.importKey(
+      "raw", hexToBytes(keyHex), { name: "AES-GCM" }, false, ["decrypt"]
+    );
+    const plaintext = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: combined.slice(0, 12) }, key, combined.slice(12)
+    );
+    return new TextDecoder().decode(plaintext);
+  } catch {
+    return null; // wrong key, corrupted data, or old plaintext token → treat as invalid
+  }
 }
 
 // ── Input validation ──────────────────────────────────────────────────────────
@@ -604,8 +650,11 @@ function oauthCorsHeaders(): Record<string, string> {
 }
 
 function mcpCorsHeaders(): Record<string, string> {
+  // MCP is server-to-server — no Access-Control-Allow-Origin is set.
+  // "null" (the string) is a valid serialized origin that matches sandboxed
+  // iframes and file:// pages, so omitting it is safer than sending it.
+  // Allow-Methods/Headers are retained for OPTIONS discoverability only.
   return {
-    "Access-Control-Allow-Origin": "null",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
   };
@@ -899,7 +948,7 @@ async function handleAuthorizePost(request: Request, env: Env): Promise<Response
       "Connection Error",
       `<h1>Connection Error</h1>
        <p>Could not reach Fathom to verify your API key. Please try again.</p>
-       <p><a href="javascript:history.back()">Go back</a></p>`
+       <p><button type="button" onclick="history.back()">Go back</button></p>`
     );
   }
 
@@ -921,11 +970,12 @@ async function handleAuthorizePost(request: Request, env: Env): Promise<Response
     );
   }
 
-  // Issue a single-use auth code
+  // Issue a single-use auth code — encrypt the key at rest
   const code = randomHex(32); // 256 bits of entropy
+  const encryptedKey = await encryptValue(apiKey, env.KV_ENCRYPTION_KEY);
   await env.FATHOM_KV.put(
     `auth_code:${code}`,
-    JSON.stringify({ fathomApiKey: apiKey, codeChallenge }),
+    JSON.stringify({ fathomApiKey: encryptedKey, codeChallenge }),
     { expirationTtl: AUTH_CODE_TTL_SECONDS }
   );
 
@@ -965,14 +1015,18 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
     return oauthError("invalid_request", "code and code_verifier are required");
   }
 
-  // Look up the auth code — do NOT delete yet; wait until PKCE passes
-  // to prevent a DoS where an attacker burns a legitimate code before the
-  // real client can complete the exchange.
+  // Look up the auth code.
   const stored = await env.FATHOM_KV.get(`auth_code:${code}`);
 
-  if (!stored) {
+  if (!stored || stored === "consumed") {
     return oauthError("invalid_grant", "Authorization code is invalid or expired");
   }
+
+  // Write a "consumed" sentinel immediately — before any async PKCE work.
+  // This narrows the TOCTOU race window (two concurrent requests with the same
+  // code both passing the get check) from PKCE verification time to one KV
+  // round-trip. The sentinel expires in 60 s; delete cleans it up on success.
+  await env.FATHOM_KV.put(`auth_code:${code}`, "consumed", { expirationTtl: 60 });
 
   let codeData: { fathomApiKey: string; codeChallenge: string };
   try {
@@ -981,20 +1035,28 @@ async function handleToken(request: Request, env: Env): Promise<Response> {
     return oauthError("server_error", "Internal error");
   }
 
-  // Verify PKCE before consuming the code
+  // Decrypt the stored Fathom API key
+  const fathomApiKey = await decryptValue(codeData.fathomApiKey, env.KV_ENCRYPTION_KEY);
+  if (!fathomApiKey) {
+    return oauthError("server_error", "Internal error");
+  }
+
+  // Verify PKCE — code is already consumed via sentinel; a failed check here
+  // burns the code intentionally (trade-off for closing the TOCTOU window).
   const pkceValid = await verifyPKCE(codeVerifier, codeData.codeChallenge);
   if (!pkceValid) {
     return oauthError("invalid_grant", "PKCE verification failed");
   }
 
-  // PKCE passed — now consume the auth code (single use)
+  // PKCE passed — clean up the sentinel
   await env.FATHOM_KV.delete(`auth_code:${code}`);
 
-  // Issue access token
+  // Issue access token — encrypt the key at rest
   const accessToken = randomHex(32); // 256 bits of entropy
+  const encryptedKey = await encryptValue(fathomApiKey, env.KV_ENCRYPTION_KEY);
   await env.FATHOM_KV.put(
     `token:${accessToken}`,
-    JSON.stringify({ fathomApiKey: codeData.fathomApiKey, issuedAt: Date.now() }),
+    JSON.stringify({ fathomApiKey: encryptedKey, issuedAt: Date.now() }),
     { expirationTtl: ACCESS_TOKEN_TTL_SECONDS }
   );
 
@@ -1053,7 +1115,7 @@ async function resolveBearerToken(
 
   try {
     const data = JSON.parse(stored) as { fathomApiKey: string };
-    return data.fathomApiKey ?? null;
+    return await decryptValue(data.fathomApiKey, env.KV_ENCRYPTION_KEY);
   } catch {
     return null;
   }
@@ -1063,6 +1125,8 @@ async function resolveBearerToken(
 export {
   timingSafeEqual,
   verifyPKCE,
+  encryptValue,
+  decryptValue,
   validateIso8601,
   validateEmail,
   validateDomain,
@@ -1155,6 +1219,8 @@ export default {
           );
         }
         const response = await handleMCP(body, fathomApiKey);
+        // No CORS headers on POST responses — MCP is server-to-server only.
+        // Claude's infrastructure calls this directly; browser CORS is not needed.
         return new Response(JSON.stringify(response), {
           headers: { "Content-Type": "application/json" },
         });

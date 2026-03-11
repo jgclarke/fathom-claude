@@ -14,10 +14,10 @@ describe("05 — CORS: MCP endpoint", () => {
     expect(acao).not.toBe("*");
   });
 
-  it("OPTIONS /mcp ACAO is exactly 'null'", async () => {
+  it("OPTIONS /mcp has no ACAO header (avoids matching null-origin sandboxed contexts)", async () => {
     const res = await SELF.fetch(new Request("https://worker.test/mcp", { method: "OPTIONS" }));
     const acao = res.headers.get("Access-Control-Allow-Origin");
-    expect(acao).toBe("null");
+    expect(acao).toBeNull();
     expect(acao).not.toBe("*");
   });
 

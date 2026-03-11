@@ -61,6 +61,7 @@ To disconnect Claude from your Fathom account, go to **Settings → Connectors**
 - **OAuth 2.0 with PKCE.** Authentication follows the standard authorization code flow. PKCE prevents auth code interception attacks.
 - **Fathom API keys are validated before storage.** An invalid key is rejected at the form — it is never stored.
 - **Tokens are 256-bit random values** stored in Cloudflare KV. They are not guessable or derivable from any public information.
+- **Fathom API keys are encrypted at rest** in KV using AES-256-GCM. The encryption key is stored as a Wrangler secret, separate from the data it protects.
 - **Auth codes are single-use and expire in 5 minutes.** They are deleted only after PKCE verification succeeds.
 - **Access tokens expire after 30 days.** Users can revoke them at any time via Claude's connector settings.
 - **The Worker URL is not published in this README.** Distribute it privately to reduce the attack surface.
@@ -114,7 +115,23 @@ preview_id = "your-preview-namespace-id"
 
 For a preview namespace (used by `npm run dev`), create a second namespace in the Cloudflare dashboard named `fathom-mcp-tokens-preview` and paste its ID as `preview_id`.
 
-### Step 3: Deploy
+### Step 3: Set the encryption key secret
+
+Fathom API keys are encrypted at rest in KV using AES-256-GCM. Generate a key and store it as a Wrangler secret:
+
+```bash
+openssl rand -hex 32 | wrangler secret put KV_ENCRYPTION_KEY
+```
+
+This only needs to be done once. The key never appears in wrangler.toml or the repo.
+
+For local dev, add the key to `.dev.vars` (gitignored):
+
+```
+KV_ENCRYPTION_KEY=<output of openssl rand -hex 32>
+```
+
+### Step 4: Deploy
 
 ```bash
 npm install
@@ -123,13 +140,24 @@ npx wrangler deploy --config wrangler.local.toml
 
 Wrangler will output your Worker URL. Share it privately with team members — do not put it in this README.
 
+### Rate limiting
+
+The `/oauth/authorize` form submission makes an outbound call to Fathom to validate each API key. Add a Cloudflare zone-level rate limiting rule to prevent abuse:
+
+- **Path:** `/oauth/authorize`
+- **Method:** POST
+- **Threshold:** 5 requests per IP per 10 minutes
+- **Action:** Block
+
+This requires no code changes — configure it in **Security → WAF → Rate limiting rules** in the Cloudflare dashboard.
+
 ### Testing locally
 
 ```bash
 npm run dev
 ```
 
-This uses the `preview_id` from `wrangler.local.toml`. The automated test suite (`npm test`) runs against an in-memory KV and does not require a live Cloudflare namespace.
+This uses the `preview_id` from `wrangler.local.toml` and `KV_ENCRYPTION_KEY` from `.dev.vars`. The automated test suite (`npm test`) runs against an in-memory KV and does not require a live Cloudflare namespace.
 
 ### Rotating / revoking tokens
 

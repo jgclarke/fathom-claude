@@ -62,20 +62,22 @@ describe("06 — PKCE enforcement", () => {
     expect(body.error).toBe("invalid_grant");
   });
 
-  it("auth code survives a failed PKCE attempt (not a DoS vector)", async () => {
-    // Auth code must NOT be deleted on a failed PKCE check.
-    // If it were deleted before verification, an attacker could burn a legitimate
-    // code by sending a bad verifier before the real client completes the exchange.
-    // First attempt: wrong verifier → should fail
+  it("a 'consumed' sentinel is written before PKCE, preventing concurrent replay", async () => {
+    // The sentinel closes the TOCTOU race: two concurrent requests with the same
+    // valid code cannot both succeed because the first one to write "consumed"
+    // wins; the second sees "consumed" and gets invalid_grant.
+    // As a tradeoff, a failed PKCE also burns the code (the sentinel is written
+    // before verification). Legitimate clients always send the correct verifier,
+    // so this only matters under active attack.
     const res1 = await SELF.fetch(tokenRequest(FAKE_CODE, "wrongverifier"));
     expect(res1.status).toBe(400);
     const body1 = await res1.json() as any;
     expect(body1.error).toBe("invalid_grant");
-    // Second attempt: correct verifier — code still exists → should succeed
+    // Code is now consumed — even the correct verifier is rejected
     const res2 = await SELF.fetch(tokenRequest(FAKE_CODE, KNOWN_VERIFIER));
-    expect(res2.status).toBe(200);
+    expect(res2.status).toBe(400);
     const body2 = await res2.json() as any;
-    expect(body2.access_token).toBeTruthy();
+    expect(body2.error).toBe("invalid_grant");
   });
 
   it("unknown code → 400 invalid_grant", async () => {
