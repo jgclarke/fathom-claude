@@ -300,7 +300,9 @@ async function handleListMeetings(
   const e2 = validateIso8601(args.created_before, "created_before");
   const e3 = validateEmail(args.invitee_email, "invitee_email");
   const e4 = validateDomain(args.invitee_domain, "invitee_domain");
-  const e5 = validateSearchQuery(args.query, "query");
+  const e5 = args.query !== undefined && args.query !== null && args.query !== ""
+    ? validateSearchQuery(args.query, "query")
+    : null;
   if (e1) errors.push(e1);
   if (e2) errors.push(e2);
   if (e3) errors.push(e3);
