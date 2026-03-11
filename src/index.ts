@@ -102,6 +102,10 @@ function hexToBytes(hex: string): Uint8Array {
 }
 
 async function encryptValue(plaintext: string, keyHex: string): Promise<string> {
+  if (!/^[0-9a-f]{64}$/i.test(keyHex)) {
+    console.error("KV_ENCRYPTION_KEY is misconfigured — must be a 64-char hex string (32 bytes)");
+    throw new Error("Invalid KV_ENCRYPTION_KEY");
+  }
   const key = await crypto.subtle.importKey(
     "raw", hexToBytes(keyHex), { name: "AES-GCM" }, false, ["encrypt"]
   );
@@ -118,6 +122,10 @@ async function encryptValue(plaintext: string, keyHex: string): Promise<string> 
 }
 
 async function decryptValue(encrypted: string, keyHex: string): Promise<string | null> {
+  if (!/^[0-9a-f]{64}$/i.test(keyHex)) {
+    console.error("KV_ENCRYPTION_KEY is misconfigured — must be a 64-char hex string (32 bytes)");
+    throw new Error("Invalid KV_ENCRYPTION_KEY");
+  }
   try {
     const combined = Uint8Array.from(atob(encrypted), (c) => c.charCodeAt(0));
     const key = await crypto.subtle.importKey(
