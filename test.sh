@@ -38,8 +38,9 @@ if [[ $# -gt 0 ]]; then
         // Map short names to API field names
         const fieldMap = { id: 'recording_id', after: 'created_after', before: 'created_before' };
         const field = fieldMap[key] || key;
-        // Coerce numeric values
-        obj[field] = isNaN(val) ? val : Number(val);
+        // Normalize whitespace (strip newlines from copy-paste), coerce numbers
+        const clean = val.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+        obj[field] = isNaN(clean) ? clean : Number(clean);
       }
       console.log(JSON.stringify(obj));
     " -- "$@")
