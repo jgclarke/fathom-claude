@@ -72,4 +72,46 @@ describe("14 — README consistency", () => {
     expect(readmeContent.toLowerCase()).not.toContain("dev_mode");
     expect(readmeContent.toLowerCase()).not.toContain("x-fathom-key");
   });
+
+  // ── Sensitive content must not appear in README ────────────────────────────
+
+  it("README does not contain a real-looking KV namespace ID (32-char hex)", () => {
+    // A committed KV namespace ID leaks infrastructure details.
+    const realIdPattern = /[0-9a-f]{32}/;
+    expect(realIdPattern.test(readmeContent)).toBe(false);
+  });
+
+  it("README does not contain a real-looking Cloudflare account ID (32-char hex)", () => {
+    // Same pattern as KV namespace IDs — catches accidental exposure.
+    const accountIdPattern = /[0-9a-f]{32}/;
+    expect(accountIdPattern.test(readmeContent)).toBe(false);
+  });
+
+  it("README does not contain anything that looks like a Fathom API key", () => {
+    // Fathom API keys start with "fathom_" followed by alphanumeric chars.
+    const fathomKeyPattern = /fathom_[a-zA-Z0-9]{8,}/;
+    expect(fathomKeyPattern.test(readmeContent)).toBe(false);
+  });
+
+  it("README does not contain anything that looks like a Bearer token (64-char hex)", () => {
+    // Access tokens are 64-char hex strings. Should never appear in docs.
+    const tokenPattern = /[0-9a-f]{64}/;
+    expect(tokenPattern.test(readmeContent)).toBe(false);
+  });
+
+  it("README does not expose the live Worker URL", () => {
+    // The worker subdomain is kept private. The README intentionally
+    // uses a placeholder — verify no real workers.dev URL slipped in.
+    expect(readmeContent).not.toMatch(/https:\/\/[a-z0-9-]+\.workers\.dev/);
+  });
+
+  it("README does not contain private internal endpoint paths beyond what is public", () => {
+    // KV key prefixes like "token:" and "auth_code:" are internal implementation
+    // details. They appear in the security section intentionally (token rotation
+    // instructions), so this test only guards against accidental raw KV dumps.
+    // Ensure no raw JSON KV payloads leaked into the README.
+    expect(readmeContent).not.toContain('"fathomApiKey"');
+    expect(readmeContent).not.toContain('"issuedAt"');
+    expect(readmeContent).not.toContain('"codeChallenge"');
+  });
 });
