@@ -318,17 +318,19 @@ async function handleListMeetings(
   const after = normalizeDate(args.created_after);
   const before = normalizeDate(args.created_before);
 
-  // Default to 1 month back if no created_after supplied — prevents unbounded
-  // pagination through entire account history and keeps responses under the
-  // 30-second Worker timeout. Pass created_after explicitly to search further back.
-  const oneMonthAgo = new Date();
-  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
-  dateParams.created_after = after ?? oneMonthAgo.toISOString();
-  if (before) dateParams.created_before = before;
-
   const filterEmail = args.invitee_email ? String(args.invitee_email).toLowerCase() : null;
   const filterDomain = args.invitee_domain ? String(args.invitee_domain).toLowerCase() : null;
   const filterQuery = args.query ? String(args.query).toLowerCase().trim() : null;
+
+  // When a search filter is provided, default to 1 year back so searches
+  // cover full history without requiring the user to specify dates.
+  // Plain listing (no filters) defaults to 1 month for a fast response.
+  // Both are bounded by the 20-second wall-clock budget in fetchAllMeetings.
+  const isSearch = !!(filterQuery || filterEmail || filterDomain);
+  const defaultWindow = new Date();
+  defaultWindow.setMonth(defaultWindow.getMonth() - (isSearch ? 12 : 1));
+  dateParams.created_after = after ?? defaultWindow.toISOString();
+  if (before) dateParams.created_before = before;
   const rawLimit = Number(args.limit ?? 50);
   const limit = isNaN(rawLimit) ? 50 : Math.min(Math.max(1, rawLimit), 500);
 
@@ -451,8 +453,9 @@ const TOOLS = [
     name: "list_meetings",
     description:
       "List and search Fathom meetings. Supports filtering by date range, attendee email, attendee domain, and free-text query (matches meeting title and attendee names). " +
-      "Defaults to the last 1 month if no date range is supplied. " +
-      "To search further back, pass created_after with an earlier date.",
+      "When a query, email, or domain filter is provided, automatically searches the last 12 months. " +
+      "Plain listing (no filters) defaults to the last 1 month. " +
+      "Pass created_after to search even further back.",
     inputSchema: {
       type: "object",
       properties: {
