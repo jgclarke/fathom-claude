@@ -39,6 +39,8 @@ const ACCESS_TOKEN_TTL_SECONDS = 2592000; // 30 days
 interface Env {
   // KV namespace bound in wrangler.toml as [[kv_namespaces]] binding = "FATHOM_KV"
   FATHOM_KV: KVNamespace;
+  // Set to "true" in .dev.vars for local testing (never set in production)
+  DEV_MODE?: string;
 }
 
 // ── Crypto helpers ────────────────────────────────────────────────────────────
@@ -156,9 +158,16 @@ async function fathomGet(
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== "") url.searchParams.set(k, v);
   }
-  const res = await fetch(url.toString(), {
-    headers: { "X-Api-Key": apiKey },
-  });
+
+  let res = await fetch(url.toString(), { headers: { "X-Api-Key": apiKey } });
+
+  // On 429, wait the Retry-After duration (or 2s) and retry once.
+  if (res.status === 429) {
+    const retryAfter = Number(res.headers.get("Retry-After") ?? 2);
+    await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+    res = await fetch(url.toString(), { headers: { "X-Api-Key": apiKey } });
+  }
+
   if (!res.ok) {
     await res.text(); // consume and discard
     throw new FathomAPIError(res.status);
@@ -261,11 +270,6 @@ async function fetchAllMeetings(
 
     if (!data.next_cursor) break;
     cursor = data.next_cursor;
-
-    // Fathom allows 60 requests/minute across all API keys.
-    // A 1-second delay between pages keeps us well under that limit
-    // regardless of how many pages we fetch.
-    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
 
   const truncated = pagesFetched >= SAFETY_CAP;
@@ -1102,8 +1106,16 @@ export default {
       if (request.method === "OPTIONS")
         return new Response(null, { headers: mcpCorsHeaders() });
 
-      // Resolve the Bearer token to a Fathom API key
-      const fathomApiKey = await resolveBearerToken(request, env);
+      // Resolve the Fathom API key.
+      // In local dev (DEV_MODE=true in .dev.vars), accept key directly via header.
+      // In production, always require a valid Bearer token from the OAuth flow.
+      let fathomApiKey: string | null = null;
+      if (env.DEV_MODE === "true") {
+        fathomApiKey = request.headers.get("X-Fathom-Key");
+      }
+      if (!fathomApiKey) {
+        fathomApiKey = await resolveBearerToken(request, env);
+      }
       if (!fathomApiKey) {
         return new Response(
           JSON.stringify({ error: "Unauthorized. Connect via Claude's Connectors settings." }),
