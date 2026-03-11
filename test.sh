@@ -17,7 +17,13 @@ set -euo pipefail
 BASE="http://localhost:8787/mcp"
 KEY="${FATHOM_KEY:?Set FATHOM_KEY=your_fathom_api_key}"
 TOOL="${1:-}"
-ARGS="${2:-{}}"
+# Validate ARGS is parseable JSON; default to {} if missing or invalid
+RAW_ARGS="${2:-}"
+if [[ -z "$RAW_ARGS" ]] || ! echo "$RAW_ARGS" | jq -e . >/dev/null 2>&1; then
+  ARGS='{}'
+else
+  ARGS="$RAW_ARGS"
+fi
 
 mcp_call() {
   local method="$1"
