@@ -4,3 +4,4 @@ dist/
 .env
 .dev.vars
 **/.DS_Store
+wrangler.local.toml

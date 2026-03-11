@@ -162,7 +162,7 @@ async function fathomGet(
 
   // On 429, wait the Retry-After duration (or 2s) and retry once.
   if (res.status === 429) {
-    const retryAfter = Number(res.headers.get("Retry-After") ?? 2);
+    const retryAfter = Math.min(Number(res.headers.get("Retry-After") ?? 2), 5);
     await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
     res = await fetch(url.toString(), { headers: { "X-Api-Key": apiKey } });
   }
@@ -300,10 +300,12 @@ async function handleListMeetings(
   const e2 = validateIso8601(args.created_before, "created_before");
   const e3 = validateEmail(args.invitee_email, "invitee_email");
   const e4 = validateDomain(args.invitee_domain, "invitee_domain");
+  const e5 = validateSearchQuery(args.query, "query");
   if (e1) errors.push(e1);
   if (e2) errors.push(e2);
   if (e3) errors.push(e3);
   if (e4) errors.push(e4);
+  if (e5) errors.push(e5);
   if (errors.length)
     return `Invalid arguments:\n${errors.map((e) => `- ${e.message}`).join("\n")}`;
 
@@ -610,7 +612,7 @@ function mcpCorsHeaders(): Record<string, string> {
 // ── HTML helpers ──────────────────────────────────────────────────────────────
 
 function htmlPage(title: string, body: string): Response {
-  const escTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const escTitle = title.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   return new Response(
     `<!DOCTYPE html>
 <html lang="en">
@@ -809,7 +811,7 @@ function handleAuthorizeGet(url: URL): Response {
 
   // Encode params for hidden fields — escape to prevent XSS
   const esc = (s: string) =>
-    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
   return htmlPage(
     "Connect Fathom to Claude",
@@ -854,7 +856,7 @@ async function handleAuthorizePost(request: Request, env: Env): Promise<Response
 
   // Escape helper for re-rendering values into HTML attributes
   const esc = (s: string) =>
-    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+    s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
   // Re-validate redirect_uri on POST — never trust hidden field alone
   if (
