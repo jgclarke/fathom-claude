@@ -8,11 +8,15 @@
     "predeploy": "npm audit --audit-level=high",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "audit": "npm audit"
+    "audit": "npm audit",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.8.71",
     "@cloudflare/workers-types": "^4.20240208.0",
     "typescript": "^5.3.3",
+    "vitest": "^3.2.4",
     "wrangler": "^4.71.0"
   }
 }

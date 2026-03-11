@@ -1052,6 +1052,17 @@ async function resolveBearerToken(
   }
 }
 
+// Named exports for testing — Workers only uses the default export
+export {
+  timingSafeEqual,
+  verifyPKCE,
+  validateIso8601,
+  validateEmail,
+  validateDomain,
+  validateRecordingId,
+  validateSearchQuery,
+};
+
 // ── Worker entry point ────────────────────────────────────────────────────────
 
 export default {
