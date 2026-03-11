@@ -17,25 +17,24 @@ set -euo pipefail
 BASE="http://localhost:8787/mcp"
 KEY="${FATHOM_KEY:?Set FATHOM_KEY=your_fathom_api_key}"
 TOOL="${1:-}"
-# Validate ARGS is parseable JSON; default to {} if missing or invalid
-RAW_ARGS="${2:-}"
-if [[ -z "$RAW_ARGS" ]] || ! echo "$RAW_ARGS" | jq -e . >/dev/null 2>&1; then
-  ARGS='{}'
-else
-  ARGS="$RAW_ARGS"
-fi
+ARGS="${2:-{}}"
+
+# Use node for JSON construction — avoids jq --argjson quirks
+make_body() {
+  node -e "
+    const method = process.argv[1];
+    const params = JSON.parse(process.argv[2]);
+    console.log(JSON.stringify({jsonrpc:'2.0',id:1,method,params}));
+  " "$1" "$2"
+}
 
 mcp_call() {
   local method="$1"
   local params_json="$2"
-  # Use jq to safely construct the body — avoids shell quoting issues
   local body
-  body=$(jq -n \
-    --arg method "$method" \
-    --argjson params "$params_json" \
-    '{"jsonrpc":"2.0","id":1,"method":$method,"params":$params}')
-  echo "Sending: $body" >&2
-  curl -s -X POST "$BASE" \
+  body=$(make_body "$method" "$params_json")
+  echo "Sending: $(echo "$body" | jq .)" >&2
+  curl -s --max-time 30 -X POST "$BASE" \
     -H "Content-Type: application/json" \
     -H "X-Fathom-Key: $KEY" \
     -d "$body" \
@@ -52,8 +51,10 @@ mcp_call "tools/list" '{}'
 if [[ -n "$TOOL" ]]; then
   echo ""
   echo "=== tools/call: $TOOL ==="
-  # Use jq to build the params object safely
-  tool_params=$(jq -n --arg name "$TOOL" --argjson args "$ARGS" \
-    '{"name":$name,"arguments":$args}')
+  tool_params=$(node -e "
+    const name = process.argv[1];
+    const args = JSON.parse(process.argv[2]);
+    console.log(JSON.stringify({name, arguments:args}));
+  " "$TOOL" "$ARGS")
   mcp_call "tools/call" "$tool_params"
 fi

@@ -229,6 +229,7 @@ interface FathomMeeting {
  *   - There is no next_cursor (end of account history)
  *   - The oldest meeting on a page is earlier than `stopBefore` (we've passed the window)
  *   - A hard safety cap of 100 pages (5000 meetings) is hit
+ *   - The wall-clock budget (20 s) is nearly exhausted, to stay under Worker timeout
  */
 async function fetchAllMeetings(
   dateParams: Record<string, string>,
@@ -237,6 +238,7 @@ async function fetchAllMeetings(
   const all: FathomMeeting[] = [];
   let cursor: string | undefined;
   const SAFETY_CAP = 100; // 100 pages × 50 = 5000 meetings max
+  const DEADLINE_MS = Date.now() + 20_000; // stop after 20 s to stay under 30 s Worker timeout
   let pagesFetched = 0;
 
   // If caller supplied a created_after bound, stop paginating once we've
@@ -246,7 +248,7 @@ async function fetchAllMeetings(
     ? new Date(dateParams.created_after).getTime()
     : null;
 
-  while (pagesFetched < SAFETY_CAP) {
+  while (pagesFetched < SAFETY_CAP && Date.now() < DEADLINE_MS) {
     const params: Record<string, string> = { limit: "50" };
     if (cursor) params.cursor = cursor;
 
@@ -272,7 +274,7 @@ async function fetchAllMeetings(
     cursor = data.next_cursor;
   }
 
-  const truncated = pagesFetched >= SAFETY_CAP;
+  const truncated = pagesFetched >= SAFETY_CAP || Date.now() >= DEADLINE_MS;
   return { meetings: all, truncated };
 }
 
@@ -316,11 +318,12 @@ async function handleListMeetings(
   const after = normalizeDate(args.created_after);
   const before = normalizeDate(args.created_before);
 
-  // Default to 6 months back if no created_after supplied — prevents unbounded
-  // pagination through entire account history, which hits Fathom's 60 req/min limit.
-  const sixMonthsAgo = new Date();
-  sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-  dateParams.created_after = after ?? sixMonthsAgo.toISOString();
+  // Default to 1 month back if no created_after supplied — prevents unbounded
+  // pagination through entire account history and keeps responses under the
+  // 30-second Worker timeout. Pass created_after explicitly to search further back.
+  const oneMonthAgo = new Date();
+  oneMonthAgo.setMonth(oneMonthAgo.getMonth() - 1);
+  dateParams.created_after = after ?? oneMonthAgo.toISOString();
   if (before) dateParams.created_before = before;
 
   const filterEmail = args.invitee_email ? String(args.invitee_email).toLowerCase() : null;
@@ -372,7 +375,7 @@ async function handleListMeetings(
   if (filtered.length > limit)
     notes.push(`Showing ${limit} of ${filtered.length} matches. Pass a higher limit or narrow with created_after/created_before.`);
   if (truncated)
-    notes.push(`Search pool capped at 5000 meetings. Results may be incomplete — narrow the date range to ensure full coverage.`);
+    notes.push(`Search pool capped (time or page limit reached). Results may be incomplete — narrow the date range to ensure full coverage.`);
 
   const noteStr = notes.length ? `\n\n(${notes.join(" ")})` : "";
   return `Found ${filtered.length} meeting(s):\n\n${lines.join("\n")}${noteStr}`;
@@ -448,7 +451,7 @@ const TOOLS = [
     name: "list_meetings",
     description:
       "List and search Fathom meetings. Supports filtering by date range, attendee email, attendee domain, and free-text query (matches meeting title and attendee names). " +
-      "Defaults to the last 6 months if no date range is supplied. " +
+      "Defaults to the last 1 month if no date range is supplied. " +
       "To search further back, pass created_after with an earlier date.",
     inputSchema: {
       type: "object",
