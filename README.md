@@ -193,12 +193,4 @@ Zero-downtime. Existing tokens continue to work after redeploy.
 - [Fathom API](https://developers.fathom.ai) — meeting data source
 - [Model Context Protocol](https://modelcontextprotocol.io) — Claude integration standard
 
----
 
-## Contributing
-
-PRs welcome. The entire server is in `src/index.ts`. To add a new tool:
-
-1. Add a definition to the `TOOLS` array
-2. Add a handler function `handleYourTool()`
-3. Add a `case` in the `tools/call` switch statement
