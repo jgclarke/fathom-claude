@@ -212,11 +212,14 @@ async function fathomGet(
     if (v !== undefined && v !== "") url.searchParams.set(k, v);
   }
 
+  // Retry with exponential backoff on 429 (up to 3 attempts total).
+  // Backoff intervals: 2s, 4s, 8s — honouring Retry-After when present.
+  const delays = [2, 4, 8];
   let res = await fetch(url.toString(), { headers: { "X-Api-Key": apiKey } });
 
-  // On 429, wait the Retry-After duration (or 2s) and retry once.
-  if (res.status === 429) {
-    const retryAfter = Math.min(Number(res.headers.get("Retry-After") ?? 2), 5);
+  for (const defaultDelay of delays) {
+    if (res.status !== 429) break;
+    const retryAfter = Number(res.headers.get("Retry-After") ?? defaultDelay);
     await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
     res = await fetch(url.toString(), { headers: { "X-Api-Key": apiKey } });
   }
@@ -303,7 +306,14 @@ async function fetchAllMeetings(
     ? new Date(dateParams.created_after).getTime()
     : null;
 
+  // Pace requests to avoid bursting Fathom's rate limiter.
+  const PAGE_DELAY_MS = 75;
+
   while (pagesFetched < SAFETY_CAP && performance.now() - startedAt < BUDGET_MS) {
+    if (pagesFetched > 0) {
+      await new Promise((resolve) => setTimeout(resolve, PAGE_DELAY_MS));
+    }
+
     const params: Record<string, string> = { limit: "50" };
     if (cursor) params.cursor = cursor;
 
